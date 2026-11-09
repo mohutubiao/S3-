@@ -1,0 +1,28 @@
+# 构建产物
+build/
+.pio/
+dist/
+tmp/
+managed_components/
+components/
+dependencies.lock
+sdkconfig
+sdkconfig.old
+
+# 临时排障文件（下划线前缀）
+_*
+*.log
+
+# 游戏 ROM（版权，禁止上传）
+*.nes
+*.NES
+*.fds
+*.unf
+
+# 系统/IDE
+.vscode/
+.devcontainer/
+.DS_Store
+.codebuddy/
+__pycache__/
+*.pyc

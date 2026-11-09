@@ -1,0 +1,30 @@
+# ESP-IDF Partition Table
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,     0x9000,    0x4000,
+otadata,  data, ota,     0xd000,    0x2000,
+phy_init, data, phy,     0xf000,    0x1000,
+# ⚠️ 2026-11-01 改过：app 从 3.75MB 扩到 6MB，空间从 assets 那边匀。
+# 原因：接入大肥鱼主题引擎后固件 4.55MB，原来的 3.75MB 装不下。
+#   · main 组件是 WHOLE_ARCHIVE，链接器禁止丢弃未引用符号，
+#     所以 11 张表情图（共 1.52MB）无论用不用都会全链进来，没法靠裁剪瘦身。
+#   · 而 pet_emotes.c 本身要引用其中 10 张（表情切换用），也不能删图。
+#
+# ⚠️ 2026-11-03 改过：ota_1 6MB → 5MB，assets 3MB → 4.5MB，storage 896KB → 384KB。
+# 原因：要做到「网页上换唤醒词」+「自定义唤醒词」。
+#   · 唤醒词模型不在固件里，全在 assets 的 srmodels.bin（实测多选模型后 app 体积
+#     一个字节都没变，只涨 assets），所以只需要 assets 空间。
+#   · 自定义唤醒词要 Multinet 中文模型（mn5q8_cn 2.15MB），内置词各 284KB。
+#     旧 assets 3MB 只剩 1.1MB，装不下 —— 官方后台报「空间不足」就是这个。
+#
+# ⚠️ 2026-11-04 改过：ota_1 5MB → 2MB，新增 romfs 3MB（GameBox-NES 双固件）。
+# 原因：板子上装两套固件（小智 + GameBox NES 模拟器），开机用 otadata 选择启动。
+#   · GameBox 固件 ~500KB，2MB 槽绰绰有余；多出来的空间给 romfs 存 NES 游戏包。
+#   · romfs 是 GameBox 的 LittleFS 游戏库分区，标签必须叫 "romfs"（storage.h 写死）。
+#   · assets / storage 的偏移和大小都没动，所以换这张表【不用整片擦除】，
+#     WiFi / 壁纸 / 唤醒词 / 主题设置全部保留；烧表后 GameBox 槽是空的，
+#     要单独把 GameBox.bin 写到 0x620000（见 _flash_gamebox 说明）。
+ota_0,    app,  ota_0,   0x20000,   0x600000,
+ota_1,    app,  ota_1,   0x620000,  0x200000,
+romfs,    data, spiffs,  0x820000,  0x300000,
+assets,   data, spiffs,  0xb20000,  0x480000,
+storage,  data, spiffs,  0xfa0000,  0x60000,
