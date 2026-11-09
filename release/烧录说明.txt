@@ -33,8 +33,13 @@ python esptool.py --chip esp32s3 --port COM口 --baud 921600 write_flash 0x0 xia
 ───────────────────────────────────────────────
 【3】ESP-NOW 无线手柄（ESP32-C3 SuperMini）
 ───────────────────────────────────────────────
-文件：gamepad.bin（916KB）
-烧录：PIO 烧录或 esptool（C3 USB 直刷，0x0 为 app 起始由镜像自带）
+① gamepad_merged.bin（980KB）★ 推荐，独立完整版
+   烧录地址：0x0，一键刷入直接能运行（含 bootloader+分区表+手柄）
+   图形烧录工具选 ESP32-C3、4MB flash。
+
+② gamepad.bin（916KB）增量更新专用
+   烧录地址：0x10000（裸 app，板上须已有 bootloader/分区表）
+   图形烧录工具不识别属正常 —— 用 esptool 命令行或改用①。
 
 功能：10 键 + X/Y 连发 + 双采样消抖 + 60Hz/10Hz 自适应功耗
 按键：A=BOOT(GPIO0) B(GPIO1) Y(GPIO2) START(GPIO4) SELECT(GPIO5)
