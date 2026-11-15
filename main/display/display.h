@@ -48,6 +48,16 @@ public:
     virtual void ClearTextGlyphs() {}
     virtual void SetEmojiCollection(std::shared_ptr<EmojiCollection>) {}
     virtual void SetupUI() { setup_ui_called_ = true; }
+    /* 2026-11-06 音乐可视化接口：基类给空实现，只有实现了音乐可视化
+       的板（zhengchen/cam 大飞鱼）才覆盖。协议层 application.cc 的
+       sentence_start（"% play_music"）/ tts stop 会调用。 */
+    virtual void SetSongTitle(const char* title) {}
+    virtual void SetMusicPlaying(bool on) {}
+    /* 2026-11-15 开机模式选择列表是否还在等按键（基类恒 false）。
+       只有带模式选择列表的板（zhengchen/cam 大飞鱼）覆盖。
+       application.cc 用它把「启动成功音」押到进系统之后播 ——
+       用户要求：选择界面期间不许响。 */
+    virtual bool IsModeSelectActive() const { return false; }
 
     inline int width() const { return width_; }
     inline int height() const { return height_; }

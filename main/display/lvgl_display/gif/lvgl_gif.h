@@ -80,6 +80,12 @@ public:
      */
     void SetFrameCallback(std::function<void()> callback);
 
+    /**
+     * 跳帧：0 = 每帧都渲染；1 = 两帧渲染一帧（帧率减半）；2 = 三帧渲染一帧
+     * 用来在 TTS 播放时把解码 + 渲染的 CPU 让给音频，缓解播放卡顿
+     */
+    void SetFrameSkip(uint32_t skip);
+
 private:
     // GIF decoder instance
     gd_GIF* gif_;
@@ -104,6 +110,10 @@ private:
     
     // Frame update callback
     std::function<void()> frame_callback_;
+
+    // 跳帧（见 SetFrameSkip）
+    uint32_t frame_skip_ = 0;
+    uint32_t frame_counter_ = 0;
     
     /**
      * Update to next frame

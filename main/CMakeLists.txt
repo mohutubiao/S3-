@@ -1,7 +1,8 @@
 # Define source files
-set(SOURCES "audio/audio_codec.cc"
+set(SOURCES             "audio/audio_codec.cc"
             "audio/audio_debugger.cc"
             "audio/audio_service.cc"
+            "audio/wake_word_models.cc"
             "audio/demuxer/ogg_demuxer.cc"
             "audio/codecs/no_audio_codec.cc"
             "audio/codecs/box_audio_codec.cc"
@@ -48,9 +49,6 @@ set(INCLUDE_DIRS "." "display" "display/lvgl_display" "display/lvgl_display/jpg"
 list(APPEND SOURCES
     "boards/common/board.cc"
     "boards/common/wifi_board.cc"
-    "boards/common/ml307_board.cc"
-    "boards/common/nt26_board.cc"
-    "boards/common/dual_network_board.cc"
     "boards/common/adc_battery_monitor.cc"
     "boards/common/axp2101.cc"
     "boards/common/backlight.cc"
@@ -65,6 +63,15 @@ list(APPEND SOURCES
 )
 if(CONFIG_XIAOZHI_NETWORK_ETHERNET)
     list(APPEND SOURCES "boards/common/ethernet_board.cc")
+endif()
+# 4G 模组（ML307 / NT26）：main 是 WHOLE_ARCHIVE，不用的板子也会被链进来，
+# 白占 35KB flash。WiFi 板就不编这三个文件
+if(NOT CONFIG_BOARD_TYPE_ZHENGCHEN_CAM)
+    list(APPEND SOURCES
+        "boards/common/ml307_board.cc"
+        "boards/common/nt26_board.cc"
+        "boards/common/dual_network_board.cc"
+    )
 endif()
 list(APPEND INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/boards/common)
 
@@ -92,6 +99,10 @@ set(EMOTE_RESOLUTION "320_240")
 # Set default assets if the board uses partition table V2
 if(CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI)
     set(BOARD_DIR "bread-compact-wifi")
+    set(BUILTIN_TEXT_FONT font_noto_sans_basic_14_1)
+    set(BUILTIN_ICON_FONT font_material_symbols_14_1)
+elseif(CONFIG_BOARD_TYPE_S3_ROBOT)
+    set(BOARD_DIR "s3-robot")
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_14_1)
     set(BUILTIN_ICON_FONT font_material_symbols_14_1)
 elseif(CONFIG_BOARD_TYPE_BREAD_COMPACT_ML307)
@@ -745,7 +756,8 @@ elseif(CONFIG_BOARD_TYPE_ZHENGCHEN_CAM)
     set(BOARD_DIR "zhengchen/cam")
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
     set(BUILTIN_ICON_FONT font_material_symbols_20_4)
-    set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_64)
+    # 全屏角色动画：素材来自 ${PROJECT_DIR}/assets/dafeiyu 下的 GIF
+    set(DEFAULT_EMOJI_COLLECTION dafeiyu)
 elseif(CONFIG_BOARD_TYPE_ZHENGCHEN_CAM_ML307)
     set(BOARD_DIR "zhengchen/cam-ml307")
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
@@ -869,6 +881,30 @@ file(GLOB BOARD_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_DIR}/*.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_DIR}/*.c
 )
+
+# ── 大肥鱼待机主题引擎 ────────────────────────────────────────────────────
+# _emotes/ 和 _themes/ 放在项目根目录（不在 boards/${BOARD_DIR}/ 下），
+# 上面的 GLOB 扫不到，必须显式加进来。
+# 只在正辰 cam 板启用：emote_imgs.c 源文件 8.4MB（编译后约 1.5MB 数据），
+# 给别的板子白编译一遍太慢。
+if(BOARD_DIR STREQUAL "zhengchen/cam")
+    list(APPEND SOURCES
+        "${PROJECT_DIR}/_emotes/emote_imgs.c"
+        "${PROJECT_DIR}/_emotes/pet_emotes.c"
+        "${PROJECT_DIR}/_emotes/pet_idle_plan.c"
+        "${PROJECT_DIR}/_themes/pet_themes.c"
+        # 唤醒呼吸球：纯整数渲染 + 脏矩形局部刷新（来自 xiaozhi-orb 组件，
+        # 代码 8KB 无堆分配；canvas 缓冲走 PSRAM，不占内部 RAM）
+        "orb/orb.c"
+        "orb/orb_audio.c"
+        "orb/spec_fft.c"        # 2026-11-06 音乐频谱 FFT
+        "orb/orb_lvgl.c"
+    )
+    list(APPEND INCLUDE_DIRS "${PROJECT_DIR}/_emotes" "${PROJECT_DIR}/_themes" "orb")
+# 2026-11-05 控制页二维码：复用 esp_emote_gfx 里的 qrcodegen.h（其头文件是
+# 组件 PRIV_INCLUDE，main 拿不到，这里把路径挂进本组件的搜索列表）。
+list(APPEND INCLUDE_DIRS "${CMAKE_CURRENT_LIST_DIR}/../managed_components/espressif2022__esp_emote_gfx/src/lib/qrcode")
+endif()
 list(APPEND SOURCES ${BOARD_SOURCES})
 
 # Select one audio engine for each chip family
@@ -1048,6 +1084,15 @@ if(CONFIG_BOARD_TYPE_ESP32_P4_FUNCTION_EV_BOARD)
         sdmmc
     )
 endif()
+# 养成玩法 / 网页控制页 / 可写存储（壁纸）用到的组件
+if(CONFIG_BOARD_TYPE_ZHENGCHEN_CAM)
+    list(APPEND MAIN_PRIV_REQUIRES_EXTRA
+        esp_http_server
+        spiffs
+        nvs_flash
+    )
+endif()
+
 idf_component_register(SRCS ${SOURCES}
                     EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
                     INCLUDE_DIRS ${INCLUDE_DIRS}
@@ -1078,6 +1123,9 @@ idf_component_register(SRCS ${SOURCES}
                         ${MAIN_PRIV_REQUIRES_EXTRA}
                     )
 
+# 2026-11-05 控制页二维码：qrcodegen 头文件路径已在上面 INCLUDE_DIRS 里追加
+# （不能在 idf_component_register 之后追加，那时变量已被消费）。
+
 # Use target_compile_definitions to define the reported board identity
 # If BOARD_NAME is empty, use BOARD_TYPE
 if(NOT BOARD_NAME)
@@ -1101,6 +1149,20 @@ if(NOT CMAKE_BUILD_EARLY_EXPANSION)
                         PRIVATE BUILTIN_TEXT_FONT=${BUILTIN_TEXT_FONT} BUILTIN_ICON_FONT=${BUILTIN_ICON_FONT}
                         PRIVATE TEXT_FONT_SIZE=${TEXT_FONT_SIZE} TEXT_FONT_BPP=${TEXT_FONT_BPP}
                         )
+endif()
+
+# 出厂默认唤醒词（2026-11-03）：网页没设过 mode 时用它，避免 srmodels.bin 里
+# 字母序靠前的模型意外变成默认（hiesp 会排在小智前面）。
+if(NOT CMAKE_BUILD_EARLY_EXPANSION)
+    if(CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS)
+        set(DEFAULT_WAKE_WORD_NAME "wn9_nihaoxiaozhi_tts")
+    elseif(CONFIG_SR_WN_WN9_HIESP)
+        set(DEFAULT_WAKE_WORD_NAME "wn9_hiesp")
+    endif()
+    if(DEFAULT_WAKE_WORD_NAME)
+        target_compile_definitions(${COMPONENT_LIB}
+                        PRIVATE DEFAULT_WAKE_WORD_NAME=\"${DEFAULT_WAKE_WORD_NAME}\")
+    endif()
 endif()
 
 # Add generation rules
@@ -1229,9 +1291,16 @@ function(build_default_assets_bin)
     # Add default emoji collection if defined
     if(DEFAULT_EMOJI_COLLECTION)
         list(APPEND BUILD_ARGS "--emoji_collection" "${DEFAULT_EMOJI_COLLECTION}")
-        file(GLOB DEFAULT_EMOJI_FILES CONFIGURE_DEPENDS
-            "${NOTO_FONTS_PATH}/png/${DEFAULT_EMOJI_COLLECTION}/*"
-        )
+        if(DEFAULT_EMOJI_COLLECTION STREQUAL "dafeiyu")
+            # 项目内置角色素材（assets/dafeiyu/*.gif）
+            file(GLOB DEFAULT_EMOJI_FILES CONFIGURE_DEPENDS
+                "${PROJECT_DIR}/assets/dafeiyu/*"
+            )
+        else()
+            file(GLOB DEFAULT_EMOJI_FILES CONFIGURE_DEPENDS
+                "${NOTO_FONTS_PATH}/png/${DEFAULT_EMOJI_COLLECTION}/*"
+            )
+        endif()
         list(APPEND DEFAULT_ASSETS_DEPENDENCIES ${DEFAULT_EMOJI_FILES})
     endif()
 
@@ -1242,6 +1311,22 @@ function(build_default_assets_bin)
 
     list(APPEND BUILD_ARGS "--esp_sr_model_path" "${ESP_SR_MODEL_PATH}")
     list(APPEND BUILD_ARGS "--noto_fonts_path" "${NOTO_FONTS_PATH}")
+
+    # 唤醒词可选清单（2026-11-03）
+    # 这些模型只进 assets 分区（srmodels.bin），不进固件 —— 实测多选后 app 体积不变。
+    # 网页上可以从中选一个（存 NVS，重启生效），也可以切成 Multinet 自定义词。
+    # ⚠️ assets 分区 4.5MB：字库 1257KB + dafeiyu 动画 300KB + 下面这些，
+    #    预算约 3.0MB。当前 mn5q8_cn(2152KB) + 2 个内置词(284KB×2) ≈ 2720KB。
+    # 2026-11-04：只留小智 + 自定义词（老肥）。删掉的 hiesp 省 284KB flash，
+    # 运行时内存不受影响（多打的模型只在 flash 里躺着，不加载）。FORCE 覆盖旧缓存。
+    set(WAKE_WORD_EXTRA_MODELS "" CACHE STRING "额外打包的内置唤醒词（逗号分隔）" FORCE)
+    set(WAKE_WORD_MULTINET_MODEL "mn5q8_cn" CACHE STRING "自定义唤醒词用的 Multinet 模型")
+    if(WAKE_WORD_EXTRA_MODELS)
+        list(APPEND BUILD_ARGS "--extra_wakenet_models" "${WAKE_WORD_EXTRA_MODELS}")
+    endif()
+    if(WAKE_WORD_MULTINET_MODEL)
+        list(APPEND BUILD_ARGS "--extra_multinet_models" "${WAKE_WORD_MULTINET_MODEL}")
+    endif()
 
     # Create custom command to build assets
     add_custom_command(

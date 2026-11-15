@@ -7,6 +7,7 @@
 #include <freertos/task.h>
 #include <cJSON.h>
 #include <esp_log.h>
+#include <cstdlib>
 #include <esp_partition.h>
 #include <esp_ota_ops.h>
 #include <esp_app_format.h>
@@ -195,12 +196,23 @@ esp_err_t Ota::CheckVersion() {
             // 设置系统时间
             struct timeval tv;
             double ts = timestamp->valuedouble;
-            
-            // 如果有时区偏移，计算本地时间
+
+            // 时区单独用 TZ 表达（POSIX 规则：东八区写成 "UTC-8"，符号相反），
+            // 存进 RTC 的仍是真 UTC 时间戳 —— 这样 SNTP 兜底同步出来的时间口径一致
             if (cJSON_IsNumber(timezone_offset)) {
-                ts += (timezone_offset->valueint * 60 * 1000); // 转换分钟为毫秒
+                int offset_min = timezone_offset->valueint;
+                int posix = -offset_min;  // 分钟 -> POSIX：东时区取负
+                char tz[32];
+                if (posix % 60 == 0) {
+                    snprintf(tz, sizeof(tz), "UTC%+d", posix / 60);
+                } else {
+                    snprintf(tz, sizeof(tz), "UTC%+d:%02d", posix / 60, std::abs(posix % 60));
+                }
+                setenv("TZ", tz, 1);
+                tzset();
+                ESP_LOGI(TAG, "timezone set to %s (offset %d min)", tz, offset_min);
             }
-            
+
             tv.tv_sec = (time_t)(ts / 1000);  // 转换毫秒为秒
             tv.tv_usec = (suseconds_t)((long long)ts % 1000) * 1000;  // 剩余的毫秒转换为微秒
             settimeofday(&tv, NULL);

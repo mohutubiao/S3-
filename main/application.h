@@ -6,6 +6,7 @@
 #include <freertos/task.h>
 #include <esp_timer.h>
 
+#include <atomic>
 #include <string>
 #include <mutex>
 #include <deque>
@@ -113,7 +114,17 @@ public:
     void RegisterMcpBroadcastCallback(std::function<void(const std::string&)> callback);
     void SetAecMode(AecMode mode);
     AecMode GetAecMode() const { return aec_mode_; }
+
+    /* 2026-11-12 语音打断开关
+       开（默认）= AI 说话时检测到唤醒词立刻打断（保持原有行为）
+       关       = AI 说话期间忽略唤醒词，等它说完再响应
+       存在 NVS「voice/interrupt」，网页和语音工具都能改。 */
+    void SetVoiceInterruptEnabled(bool enable);
+    bool IsVoiceInterruptEnabled() const { return voice_interrupt_enabled_; }
     void PlaySound(const std::string_view& sound);
+    /* 2026-11-15 开机模式选择列表还开着时，启动成功音被押后（见
+       HandleActivationDoneEvent）。列表收起后由显示层调用本函数补播。 */
+    void PlaySuccessSoundIfIdle();
     AudioService& GetAudioService() { return audio_service_; }
     
     /**
@@ -123,18 +134,42 @@ public:
      */
     void ResetProtocol();
 
+    /**
+     * 只关闭音频通道，**保留** protocol_ 对象（2026-11-12 图传模式用）
+     *
+     * 与 ResetProtocol 的区别很关键：ResetProtocol 会把 protocol_ 置空，之后
+     * HandleWakeWordDetectedEvent 第一句 `if (!protocol_) return;` 就直接返回 ——
+     * 设备从此叫不醒，只能重启。本函数只断 WS/TLS 会话，下次唤醒会重新
+     * OpenAudioChannel，行为等同于「说完话回到待机后再唤醒」。
+     *
+     * 用途：图传要抢内部 SRAM，先把在线的加密会话（十几 KB）还回来。
+     * 内部走 Schedule，在 application 主任务里执行。
+     */
+    void CloseAudioChannelForSuspend();
+
 private:
     Application();
     ~Application();
+
+    /* 2026-11-15 AEC 唯一执行入口：notify=false 时静默切换（菜单/网页的
+       「语音打断」开关用，避免通知盖住菜单）。SetAecMode 是 notify=true 的包装。 */
+    void ApplyAecMode(AecMode mode, bool notify);
 
     std::mutex mutex_;
     std::deque<std::function<void()>> main_tasks_;
     std::unique_ptr<Protocol> protocol_;
     EventGroupHandle_t event_group_ = nullptr;
     esp_timer_handle_t clock_timer_handle_ = nullptr;
+    /* 2026-11-14 唤醒加速：退出 listening 后**延迟**关音频通道。
+       只要通道还在，下次唤醒直接 SetListeningMode（100~200ms），
+       不必重走 TCP+TLS+server hello（800~1100ms）。空闲 60s 才真关。 */
+    esp_timer_handle_t idle_channel_close_timer_ = nullptr;
     DeviceStateMachine state_machine_;
     ListeningMode listening_mode_ = kListeningModeAutoStop;
     AecMode aec_mode_ = kAecOff;
+    bool voice_interrupt_enabled_ = true;   /* 2026-11-12 语音打断开关 */
+    /* 2026-11-15 启动成功音押后标志（开机模式选择列表还开着时置位） */
+    bool success_sound_pending_ = false;
     std::string last_error_message_;
     AudioService audio_service_;
     std::unique_ptr<Ota> ota_;
@@ -142,9 +177,17 @@ private:
     std::function<void(const std::string&)> mcp_broadcast_callback_;
 
     bool has_server_time_ = false;
-    bool aborted_ = false;
+    /* 2026-11-14 原子化：收包在协议任务里读，abort 在主任务里写 */
+    std::atomic<bool> aborted_{false};
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
+    /* 2026-11-15：语音唤醒慢路径在 BeginWakeWordInvoke 里就已经"一叫就响"播过
+       提示音了，ContinueWakeWordInvoke 不能再置 play_popup_on_listening_，
+       否则进 listening 时会重复响一次（"叮叮"）。 */
+    bool wake_popup_preplayed_ = false;
+    /* 2026-11-15：进入 idle 的时刻（esp_timer 微秒）。用于"回待机 1.5s 内
+       不接唤醒词"的冷却 —— 防止按 BOOT 退出后自己语音尾巴被误认。 */
+    int64_t idle_enter_us_ = 0;
     bool pending_listening_start_ = false;  // Waiting for playback to drain before starting listening (auto mode)
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
@@ -159,6 +202,9 @@ private:
     void HandleNetworkDisconnectedEvent();
     void HandleActivationDoneEvent();
     void HandleWakeWordDetectedEvent();
+    /* 2026-11-14 唤醒加速用：安排/取消「空闲 60s 关音频通道」 */
+    void ScheduleIdleChannelClose();
+    void CancelIdleChannelClose();
     void ContinueOpenAudioChannel(ListeningMode mode);
     void BeginWakeWordInvoke(const std::string& wake_word);
     void ContinueWakeWordInvoke(const std::string& wake_word);

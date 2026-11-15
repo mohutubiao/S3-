@@ -342,8 +342,17 @@ void McpServer::ParseCapabilities(const cJSON* capabilities) {
                     token_str = std::string(token->valuestring);
                 }
                 camera->SetExplainUrl(url_str, token_str);
+                /* 视觉能力是「表情模拟」「take_photo」的前置条件，
+                   显式打一条日志，省得功能不生效时靠猜。 */
+                ESP_LOGI(TAG, "相机视觉已启用: %s", url_str.c_str());
+            } else {
+                /* 2026-11-11：原来这里静默 —— 服务端发了 vision 对象但没给 url
+                   时毫无日志，拍照失败只能靠猜。补上。 */
+                ESP_LOGW(TAG, "服务端下发 vision 但缺 url：拍照识别不可用");
             }
         }
+    } else {
+        ESP_LOGW(TAG, "服务端未下发 vision 能力：拍照识别（含表情模拟）不可用");
     }
 }
 
@@ -549,11 +558,14 @@ void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* to
 
     // Use main thread to call the tool
     auto& app = Application::GetInstance();
+    /* 2026-11-11 取证日志：工具到底有没有被调用（用户报"摄像头调用不了"
+       时需要区分「LLM 没调工具」还是「调了但执行失败」）。 */
+    ESP_LOGI(TAG, "MCP 调用工具: %s", tool_name.c_str());
     app.Schedule([this, id, tool_iter, arguments = std::move(arguments)]() {
         try {
             ReplyResult(id, (*tool_iter)->Call(arguments));
         } catch (const std::exception& e) {
-            ESP_LOGE(TAG, "tools/call: %s", e.what());
+            ESP_LOGE(TAG, "tools/call 失败(%s): %s", (*tool_iter)->name().c_str(), e.what());
             ReplyError(id, e.what());
         }
     });

@@ -2,6 +2,8 @@
 #include "application.h"
 #include "board.h"
 #include "settings.h"
+#include "wifi_manager.h"
+#include "lwip/stats.h"
 
 #include <esp_log.h>
 #include <arpa/inet.h>
@@ -9,6 +11,11 @@
 #include "assets/lang_config.h"
 
 #define TAG "MQTT"
+
+/* 乱序重排窗深度（2026-11-07 卡顿修复）：3 包 ≈ 180ms。
+   真实 UDP 乱序一般在 20~50ms 内回来，3 包足够覆盖；
+   超过它还等不到的缺口按真丢包处理（补静音帧，流不断）。 */
+static constexpr size_t kReorderHoldPackets = 3;
 
 MqttProtocol::MqttProtocol() {
     event_group_handle_ = xEventGroupCreate();
@@ -19,6 +26,10 @@ MqttProtocol::MqttProtocol() {
             [](void* arg) {
                 MqttProtocol* protocol = (MqttProtocol*)arg;
                 auto& app = Application::GetInstance();
+                /* ⚠️ 2026-11-07 修复「放一会就再也连不上」：旧逻辑只在 Idle
+                   才重连 —— 正忙（播音乐/对话）时断线就直接跳过，且不排下一
+                   次，设备从此离线到用户手动唤醒。现在忙时也继续排 10s 后
+                   再试，直到回到 Idle 完成重连。 */
                 if (app.GetDeviceState() == kDeviceStateIdle) {
                     ESP_LOGI(TAG, "Reconnecting to MQTT server");
                     auto alive = protocol->alive_;  // Capture alive flag
@@ -27,6 +38,9 @@ MqttProtocol::MqttProtocol() {
                             protocol->StartMqttClient(false);
                         }
                     });
+                } else {
+                    esp_timer_start_once(protocol->reconnect_timer_,
+                                         MQTT_RECONNECT_INTERVAL_MS * 1000);
                 }
             },
         .arg = this,
@@ -158,6 +172,9 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
     if (!mqtt_->Connect(broker_address, broker_port, client_id, username, password)) {
         ESP_LOGE(TAG, "Failed to connect to endpoint, code=%d", mqtt_->GetLastError());
         SetError(Lang::Strings::SERVER_NOT_CONNECTED);
+        /* ⚠️ 2026-11-07：连接失败绝不能一死了之 —— 10 秒后再试，
+           否则一次网络抖动 = 永久离线（用户实测「放一会连不上服务器」）。 */
+        esp_timer_start_once(reconnect_timer_, MQTT_RECONNECT_INTERVAL_MS * 1000);
         return false;
     }
 
@@ -297,14 +314,9 @@ bool MqttProtocol::OpenAudioChannel() {
         {
             std::lock_guard<std::mutex> lock(channel_mutex_);
             if (sequence <= remote_sequence_) {
-                ESP_LOGW(TAG, "Received duplicate/old audio sequence: %lu, last: %lu", sequence,
-                         remote_sequence_);
                 return;
             }
-            if (sequence != remote_sequence_ + 1) {
-                ESP_LOGW(TAG, "Received audio packet with wrong sequence: %lu, expected: %lu",
-                         sequence, remote_sequence_ + 1);
-            }
+            /* 跳跃警告挪到下面重排逻辑里，这里只拦老包 */
         }
 
         const size_t decrypted_size = payload_len;
@@ -320,17 +332,102 @@ bool MqttProtocol::OpenAudioChannel() {
             ESP_LOGE(TAG, "Failed to decrypt audio data");
             return;
         }
+        last_incoming_time_ = std::chrono::steady_clock::now();
         {
             std::lock_guard<std::mutex> lock(channel_mutex_);
+            /* ── 链路判定仪表（2026-11-07）：每 100 包打一条，用数据分清责任方：
+               · jumps/saved = 乱序与重排救回；
+               · plc = 确认丢失后补的静音帧（听感小空洞）；
+               · gaps = 相邻包到达间隔 >150ms 的次数 —— 音频流 60ms 一包，
+                 正常到达间隔稳如时钟。gap 多 = 包一阵一阵来（链路抖动或
+                 服务器出流慢），gap 少 = 链路平稳；
+               · rssi = WiFi 信号强度（<-70dBm 信号差，丢包大概率来自这里）。
+               判读：gaps 高+jumps 高 = 网络链路问题；gaps 高+jumps≈0 =
+               服务器出流慢；两者都低还卡 = 设备端问题，继续查设备。 */
+            static uint32_t stat_pkts = 0, stat_jumps = 0, stat_saved = 0, stat_plc = 0, stat_gaps = 0;
+            static std::chrono::steady_clock::time_point stat_last_arrival;
+            auto arrival = std::chrono::steady_clock::now();
+            if (stat_pkts > 0 && arrival - stat_last_arrival > std::chrono::milliseconds(150)) {
+                stat_gaps++;
+            }
+            stat_last_arrival = arrival;
+            stat_pkts++;
+            /* ── 乱序重排 + 丢包补偿：按序包立即放行（零额外延迟）；跳跃包
+               进重排窗等一等，迟到的按序补放（救回真包）；积压超过窗口
+               （≈180ms）才确认缺口真丢 —— 补静音帧保持流连续。 */
             if (sequence <= remote_sequence_) {
+                return;   // 老包/重复包，照旧丢弃
+            }
+            if (sequence == remote_sequence_ + 1) {
+                remote_sequence_ = sequence;
+                if (on_incoming_audio_ != nullptr) {
+                    on_incoming_audio_(std::move(packet));
+                }
+                /* 把重排窗里现在连续的包按序补放出去 */
+                for (;;) {
+                    auto hit = reorder_buf_.find(remote_sequence_ + 1);
+                    if (hit == reorder_buf_.end()) {
+                        break;
+                    }
+                    remote_sequence_ = hit->first;
+                    stat_saved++;
+                    if (on_incoming_audio_ != nullptr) {
+                        on_incoming_audio_(std::move(hit->second));
+                    }
+                    reorder_buf_.erase(hit);
+                }
                 return;
             }
-            remote_sequence_ = sequence;
+            /* 跳跃：先 hold 住（真乱序的包等它的前驱，别当丢包扔了） */
+            stat_jumps += sequence - remote_sequence_ - 1;
+            reorder_buf_[sequence] = std::move(packet);
+            if (reorder_buf_.size() > kReorderHoldPackets) {
+                while (reorder_buf_.size() > 0) {
+                    /* 缺口确认丢失：补一帧静音，把序列推进到下一个手上的包 */
+                    auto plc = std::make_unique<AudioStreamPacket>();
+                    plc->sample_rate = server_sample_rate_;
+                    plc->frame_duration = server_frame_duration_;
+                    plc->timestamp = 0;
+                    plc->payload.clear();   /* 空 payload = 解码层输出静音帧 */
+                    remote_sequence_++;
+                    stat_plc++;
+                    if (on_incoming_audio_ != nullptr) {
+                        on_incoming_audio_(std::move(plc));
+                    }
+                    auto hit = reorder_buf_.find(remote_sequence_);
+                    if (hit == reorder_buf_.end()) {
+                        break;   /* 下一个还在路上，继续等 */
+                    }
+                    remote_sequence_ = hit->first;
+                    stat_saved++;
+                    if (on_incoming_audio_ != nullptr) {
+                        on_incoming_audio_(std::move(hit->second));
+                    }
+                    reorder_buf_.erase(hit);
+                }
+            }
+            if (stat_pkts % 100 == 0) {
+                int8_t rssi = (int8_t)WifiManager::GetInstance().GetRssi();
+                /* 定责关键：lwIP 协议栈收到的 UDP datagram 增量。
+                   若它 ≈ pkts 增量 → 协议栈全收下了，丢包发生在上游（网络/服务器）；
+                   若它 明显大于 pkts 增量 → 协议栈收到了但应用层没消化 → 设备端责任。 */
+                static uint32_t stat_last_udp_in = 0;
+#if CONFIG_LWIP_STATS
+                uint32_t udp_in_now = lwip_stats.udp.recv;
+                uint32_t udp_in_delta = udp_in_now - stat_last_udp_in;
+                stat_last_udp_in = udp_in_now;
+#else
+                uint32_t udp_in_delta = 0;   /* lwIP 统计未开启 */
+#endif
+                ESP_LOGI(TAG, "audio stats: pkts=%u(+100) lwip_udp_in=+%d jumps=%u saved=%u plc=%u gaps=%u (%.1f%% loss) rssi=%d",
+                         stat_pkts, (int)udp_in_delta, stat_jumps, stat_saved, stat_plc, stat_gaps,
+                         stat_pkts > 0 ? 100.0f * stat_plc / (stat_pkts + stat_plc) : 0.0f,
+                         (int)rssi);
+            }
         }
-        last_incoming_time_ = std::chrono::steady_clock::now();
-        if (on_incoming_audio_ != nullptr) {
-            on_incoming_audio_(std::move(packet));
-        }
+        /* ⚠️ 这里绝不能再碰 packet：重排逻辑里 packet 已被 move 进回调或
+           reorder_buf_，旧代码残留的放行调用在这里拿到的是空指针 ——
+           就是它把系统搞崩的（LoadProhibited @ EXCVADDR 0x8）。 */
     });
 
     if (!udp->Connect(udp_server_, udp_port_)) {
@@ -462,6 +559,7 @@ void MqttProtocol::ParseServerHello(const cJSON* root) {
         aes_nonce_ = std::move(aes_nonce);
         local_sequence_ = 0;
         remote_sequence_ = 0;
+        reorder_buf_.clear();   /* 新通道新序列空间，重排窗里的旧包全作废 */
     }
     xEventGroupSetBits(event_group_handle_, MQTT_PROTOCOL_SERVER_HELLO_EVENT);
 }

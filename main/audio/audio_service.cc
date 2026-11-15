@@ -1,6 +1,16 @@
 #include "audio_service.h"
 #include <esp_log.h>
+#include <esp_heap_caps.h>   // heap_caps_malloc / MALLOC_CAP_SPIRAM：opus 任务栈挪 PSRAM 用
+#include <esp_timer.h>       // 2026-11-15 输出断档定责：取单调微秒
+#include <esp_wifi.h>        // 2026-11-15 播放期查询 WiFi 省电级别
+#include <algorithm>         // 2026-11-15 抖动缓冲 min/max
 #include <cstring>
+#include <cmath>             // 2026-11-07 上行回声门限 sqrt/RMS
+
+/* 2026-11-15 跨模块诊断（定义在 protocols/websocket_protocol.cc）：
+   最后一包下行音频到达的单调毫秒。AudioOutputTask 用它判断"输出断档时
+   上游到底有没有数据"，从而把卡音分成 local（设备端）和 upstream（上游）。 */
+extern uint32_t g_ws_last_audio_arrival_ms;
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)        \
     (esp_ae_rate_cvt_cfg_t)                                  \
@@ -134,12 +144,19 @@ void AudioService::Start() {
         vTaskDelete(NULL);
     }, "audio_input", 2048 * 3, this, 8, &audio_input_task_handle_, 0);
 
-    /* Start the audio output task */
-    xTaskCreate([](void* arg) {
+    /* Start the audio output task
+       2026-11-15：prio 4 → 5 并绑 core1。原来它没绑核，会随调度器在两个核之间漂，
+       和 WiFi(0)/audio_input(0,prio8) 撞上时 I2S 喂数被打断 → 爆音。
+       core1 上只有 opus_codec(5) 和 LVGL(1)，LVGL 压不过它，节奏稳定得多。 */
+    xTaskCreatePinnedToCore([](void* arg) {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->AudioOutputTask();
         vTaskDelete(NULL);
-    }, "audio_output", 2048 * 2, this, 4, &audio_output_task_handle_);
+        /* 2026-11-15 优先级 5 → 7：实测出现过一次超过 1 秒的输出断档，
+           而任务本身大部分时间阻塞在 I2S 写入上、几乎不占 CPU ——
+           提优先级只影响"醒来后多快能跑"，不会饿死别的任务。
+           高于 opus 解码(5)，避免同优先级时间片轮转把喂数推迟。 */
+    }, "audio_output", 2048 * 2, this, 7, &audio_output_task_handle_, 1);
 #else
     /* Start the audio input task */
     xTaskCreate([](void* arg) {
@@ -157,11 +174,46 @@ void AudioService::Start() {
 #endif
 
     /* Start the opus codec task */
+    // ⚠️ 2026-10-31 改动说明（这台机器内部 SRAM 极紧，历史最低只剩 263 字节）：
+    //  1) 原先用 xTaskCreate 动态分配，栈在内部 SRAM。抓到过实锤崩溃
+    //     "A stack overflow in task opus_codec has been detected"，
+    //     时机在 StateMachine: connecting -> listening，即用户语音唤醒那一瞬。
+    //  2) 第一次修法把栈从 16KB 提到 24KB —— 结果音频干脆起不来（语音唤醒不了、
+    //     唤醒也不说话）—— 说明在内部 SRAM 里扩栈这条路走不通。
+    //  3) 现在的做法：栈和 TCB 都从 PSRAM 出（板上有 8MB，基本闲置），
+    //     内部 SRAM 一点不占，于是可以放心给到 32KB 余量。
+    //     拿不到 PSRAM 时退回动态创建，保住「至少能用」。
+    constexpr uint32_t kOpusStackBytes = 2048 * 16;   // 32KB
+    void* stack_buf = heap_caps_malloc(kOpusStackBytes, MALLOC_CAP_SPIRAM);
+    // ⚠️ TCB 绝对不能放 PSRAM！FreeRTOS 会断言：
+    //   assert failed: xTaskCreateStaticPinnedToCore
+    //     freertos_tasks_c_additions.h:300 (xPortCheckValidTCBMem(pxTaskBuffer))
+    // 这条约束只针对 TCB，栈是可以放 PSRAM 的（xPortCheckValidStackMem 允许）。
+    // 我第一版把两块都丢进 PSRAM，结果每次启机必崩、无限重启 —— 别再犯。
+    void* task_buf = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
+    if (stack_buf != nullptr && task_buf != nullptr) {
+        opus_codec_task_handle_ = xTaskCreateStaticPinnedToCore(
+            [](void* arg) {
+                auto* audio_service = static_cast<AudioService*>(arg);
+                audio_service->OpusCodecTask();
+                vTaskDelete(NULL);
+            },
+            "opus_codec", kOpusStackBytes / sizeof(StackType_t), this, 5,
+            static_cast<StackType_t*>(stack_buf), static_cast<StaticTask_t*>(task_buf),
+            1);   /* ⚠️ 2026-11-07 卡顿优化：prio 2→5、绑 core1 —— 原来 2 比
+                     彩灯(3)/AFE(3)都低还到处漂，解码这种每 60ms 一帧的硬实时
+                     活被随意挤占。core1 与 LVGL(prio1) 同核：LVGL 压不过它；
+                     core0 留给 audio_input(prio8)+WiFi。 */
+        ESP_LOGI(TAG, "opus_codec 栈已落在 PSRAM (%u B)，内部 SRAM 不占",
+                 (unsigned)kOpusStackBytes);
+        return;
+    }
+    ESP_LOGW(TAG, "PSRAM 分配失败，opus_codec 栈退回内部 RAM (16KB)");
     xTaskCreate([](void* arg) {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->OpusCodecTask();
         vTaskDelete(NULL);
-    }, "opus_codec", 2048 * 12, this, 2, &opus_codec_task_handle_);
+    }, "opus_codec", 2048 * 8, this, 5, &opus_codec_task_handle_);
 }
 
 void AudioService::Stop() {
@@ -267,7 +319,10 @@ void AudioService::AudioInputTask() {
         }
 
         if (audio_input_need_warmup_.exchange(false)) {
-            vTaskDelay(pdMS_TO_TICKS(120));
+            /* ⚠️ 2026-11-07 延迟优化：120 → 40ms。原来唤醒后麦克风白等
+               120ms 才开始收音 —— 40ms 足够 codec 启动稳定，砍掉 80ms
+               唤醒响应延迟。开头若偶有一帧杂音，AFE 的 AEC/VAD 会兜住。 */
+            vTaskDelay(pdMS_TO_TICKS(40));
             continue;
         }
 
@@ -321,8 +376,53 @@ void AudioService::AudioOutputTask() {
             break;
         }
 
+        /* ── 2026-11-15 自适应抖动缓冲（用户选型：平时无感、卡过变稳）─────────
+           实测现象：服务端按分片推流，一批 9~14 包（0.5~0.8s）一次性到达，
+           批与批之间停 0.6~1.0s；而设备端总缓冲只有 ~0.42s，停顿超过它就断一下。
+           修法：每轮开口前先攒够 jitter_target_ms_ 的音频，用"晚开口"换"不断续"。
+           自适应：断流一次 → 目标 +200ms（上限 800ms）；一整轮没断 → -100ms
+           （下限 200ms）。所以正常对话几乎无感，只有在真卡过的会话里才多缓一点。
+           ⚠️ 计数要算「播放队列 + 解码队列」：单看播放队列永远到不了 6 帧以上，
+           会一直等到超时。 */
+        if (jitter_priming_) {
+            const int frame_ms = decoder_duration_ms_ > 0 ? decoder_duration_ms_ : 60;
+            const size_t need = (size_t)std::max(1, jitter_target_ms_ / frame_ms);
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(jitter_target_ms_ + 500);
+            while (!service_stopped_.load() && std::chrono::steady_clock::now() < deadline) {
+                const size_t buffered = audio_playback_queue_.size() + audio_decode_queue_.size() +
+                                        (decode_in_flight_ ? 1 : 0);
+                if (buffered >= need) {
+                    break;
+                }
+                audio_queue_cv_.wait_for(lock, std::chrono::milliseconds(20));
+            }
+            jitter_priming_ = false;
+            ESP_LOGI(TAG, "抖动缓冲就绪：目标 %dms，实攒 %u 帧（≈%ums）", jitter_target_ms_,
+                     (unsigned)(audio_playback_queue_.size() + audio_decode_queue_.size()),
+                     (unsigned)((audio_playback_queue_.size() + audio_decode_queue_.size()) * frame_ms));
+        }
+
         auto task = std::move(audio_playback_queue_.front());
         audio_playback_queue_.pop_front();
+
+        // 卡顿诊断（2026-11-15 升级）：
+        // 旧指标只看"取帧时队列空"，可它无法区分「解码慢」和「上游断供」——
+        // 播放节奏≈到达节奏时队列本来就常空，数值高低并不等于听感卡顿。
+        // 真正可听的爆音 = 相邻两次喂 I2S 的间隔明显超过一帧时长（60ms），
+        // DMA 在那段时间里没数据，喇叭就是静音/咔哒。所以统计三件事：
+        //   gap  = 相邻 OutputData 调用间隔 >200ms 的次数（>3 帧 = 必然可听）；
+        //   gmax = 本窗口最大间隔 ms（2 秒 = 整句没声，200ms = 抖一下）；
+        //   cost = OutputData 自身耗时（>60ms 说明任务被抢占/写 I2S 阻塞）。
+        // 对照同时刻的 "ws audio stats"：gmax 大且 ws 同期也没包 = 上游出流洞；
+        // gmax 大而 ws 同期有包 = 设备端解码/调度问题。
+        static uint32_t s_total = 0, s_gap = 0, s_gmax = 0, s_costmax = 0, s_local = 0, s_upstream = 0;
+        static auto s_last_out = std::chrono::steady_clock::now();
+        static bool s_has_last = false;
+        /* 与 g_ws_last_audio_arrival_ms 同一时钟域（esp_timer 毫秒），
+           用于判断"断档期间有没有收到包"。 */
+        static uint32_t s_last_out_ms = 0;
+
         output_in_flight_ = true;
         audio_queue_cv_.notify_all();
         lock.unlock();
@@ -333,7 +433,89 @@ void AudioService::AudioOutputTask() {
             codec_->EnableOutput(true);
         }
 
+        auto out_begin = std::chrono::steady_clock::now();
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        if (s_has_last) {
+            auto gap_ms = (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(out_begin - s_last_out)
+                              .count();
+            /* ⚠️ >2s 的间隔是对话静默（一轮说完等下一轮），不是播放断档。
+               以前把它算进 gmax，才会出现 "gmax=122532ms" 这种废数据，
+               连 local/upstream 归因也一起被污染。直接丢弃这一样本。 */
+            if (gap_ms > 200 && gap_ms <= 2000) {
+                s_gap++;
+                /* 自适应：真断了一次就把缓冲目标加上去，下一轮开口更晚但不断 */
+                jitter_turn_had_gap_ = true;
+                if (jitter_target_ms_ < kJitterMaxMs) {
+                    jitter_target_ms_ = std::min(kJitterMaxMs, jitter_target_ms_ + 200);
+                    ESP_LOGW(TAG, "断流 %ums → 抖动缓冲目标提到 %dms", (unsigned)gap_ms, jitter_target_ms_);
+                }
+                /* 2026-11-15 断档定责（第三版，修正前两版的偏差）：
+                   旧判据「窗口内有没有收到包」是错的 —— 断档结束那个包本身就是
+                   "窗口内到达"的，于是 upstream 断供也会被算成 local。
+                   正确判据：**数据到手后闲置了多久才被喂进 I2S**。
+                     · 最后一包在 100ms 之前就到了，我们却一直没输出
+                       → local（设备端 stall，数据在手却卡住）；
+                     · 最后一包刚刚才到（≤100ms）→ upstream（上游断供，
+                       是这包把播放叫醒的，改设备没用）。 */
+                uint32_t last_arrival = g_ws_last_audio_arrival_ms;
+                if (last_arrival <= now_ms && (now_ms - last_arrival) > 100) {
+                    s_local++;
+                } else {
+                    s_upstream++;
+                }
+
+                /* 2026-11-15 断档后的"接缝"处理：上游洞（实测 1.2~1.8s）设备端填不平，
+                   但可以让它**听不出来是故障** —— 洞结束时 PCM 是从非零幅度突然续上，
+                   喇叭就是"啪"一下的咔哒。给这一帧开头 15ms 线性淡入，接缝变成自然起音。 */
+                /* ⚠️ 解码输出是单声道 PCM（多声道扩张由 codec 的 Write 做），
+                   所以这里按单声道处理，别用 output_channels() 去算步长。 */
+                const int rate = codec_->output_sample_rate();
+                int ramp_frames = rate > 0 ? rate * 15 / 1000 : 0;
+                if (ramp_frames > (int)task->pcm.size()) {
+                    ramp_frames = (int)task->pcm.size();
+                }
+                for (int f = 0; f < ramp_frames; ++f) {
+                    const int32_t gain = (int32_t)(65536.0f * (float)f / (float)ramp_frames);
+                    task->pcm[f] = (int16_t)(((int32_t)task->pcm[f] * gain) >> 16);
+                }
+            } else if (gap_ms > 2000) {
+                /* 跨轮静默：本窗口不下结论，直接跳过，别污染统计 */
+            }
+            if (gap_ms > 200 && gap_ms <= 2000 && gap_ms > s_gmax) {
+                s_gmax = gap_ms;
+            }
+        }
+        s_last_out = out_begin;
+        s_last_out_ms = now_ms;
+        s_has_last = true;
+
         codec_->OutputData(task->pcm);
+
+        {
+            auto cost_ms = (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - out_begin)
+                               .count();
+            if (cost_ms > s_costmax) {
+                s_costmax = cost_ms;
+            }
+            if (++s_total >= 128) {
+                /* 2026-11-15 播放期省电状态：ping 实测本机 MTU 往返 18~121ms 锯齿，
+                   是 modem sleep 的典型特征。这行直接给出播放时 WiFi 到底睡不睡 ——
+                   ps=0(NONE 不睡) / 1(MIN_MODEM) / 2(MAX_MODEM)。
+                   若这里是 1/2，说明省电没压住，抖动和 TCP 队头阻塞都由此而来。 */
+                wifi_ps_type_t ps = WIFI_PS_MIN_MODEM;
+                esp_wifi_get_ps(&ps);
+                ESP_LOGW(TAG,
+                         "AUDIO out: frames=%u gap>200ms=%u(local=%u upstream=%u) gmax=%ums costmax=%ums ps=%d",
+                         s_total, s_gap, s_local, s_upstream, (unsigned)s_gmax, (unsigned)s_costmax, (int)ps);
+                s_total = 0;
+                s_gap = 0;
+                s_gmax = 0;
+                s_costmax = 0;
+                s_local = 0;
+                s_upstream = 0;
+            }
+        }
 
         /* Update the last output time */
         last_output_time_ = std::chrono::steady_clock::now();
@@ -387,7 +569,14 @@ void AudioService::OpusCodecTask() {
 
             SetDecodeSampleRate(packet->sample_rate, packet->frame_duration);
             bool decoded = false;
-            if (opus_decoder_ != nullptr) {
+            if (packet->payload.empty()) {
+                /* ── PLC 丢包补偿（2026-11-07 卡顿修复）──
+                   协议层对确认丢失的帧补了空 payload 包：这里不解码，
+                   直接输出一帧静音保持播放流连续 —— UDP 丢 22% 的包时，
+                   旧逻辑表现为声音一段段断，现在听感是"短暂弱音"。 */
+                task->pcm.assign(decoder_frame_size_, 0);
+                decoded = true;
+            } else if (opus_decoder_ != nullptr) {
                 task->pcm.resize(decoder_frame_size_);
                 esp_audio_dec_in_raw_t raw = {
                     .buffer = (uint8_t *)(packet->payload.data()),
@@ -451,6 +640,36 @@ void AudioService::OpusCodecTask() {
             packet->timestamp = task->timestamp;
 
             if (opus_encoder_ != nullptr && task->pcm.size() == encoder_frame_size_) {
+                /* 上行门限：RMS 低于它视为回声残余（发静音）。真人说话 RMS
+                   通常 >1000，回声残余 <300 —— 原值 400 居中偏安全。
+                   ⚠️ 2026-11-15 实测日志三次打断都是 `suppressed=NN passed=0`：
+                   AI 说话期间**一帧都没放行**，说明 400 对轻声打断偏高，
+                   用户直接开口的声音被整段填成静音，服务器收不到 → 只能等超时
+                   回待机（表现为"打断像没反应"）。降到 280 让正常说话容易过，
+                   离回声残余（<300）仍有区分度；若出现 AI 被自己声音打断，
+                   再往 320~350 回调。 */
+                static constexpr double kUplinkGateRms = 280.0;
+                /* ── 2026-11-07 上行静音门限（AI 回话碎段根治）──
+                   现象：AI 说话被服务器切成一段一段（两个通道都复现，
+                   日志见 WS 收到服务器 0x8 关闭帧）。机理：喇叭声的 AEC
+                   残余被麦克风收走上行，服务器 VAD 误判用户插话 → 掐 TTS。
+                   方案：AI 说话（uplink_suppress_）时算短时 RMS —— 低于门限
+                   （回声残余）发静音帧；高于门限（真人喊话，能量远高于回声）
+                   原样放行，语音打断功能保留。唤醒词/BOOT 打断不走这条上行，
+                   不受影响。 */
+                if (uplink_suppress_.load() && task->type == kAudioTaskTypeEncodeToSendQueue) {
+                    int64_t acc = 0;
+                    for (int16_t s : task->pcm) {
+                        acc += (int64_t)s * s;
+                    }
+                    const double rms = sqrt((double)acc / (double)task->pcm.size());
+                    if (rms < kUplinkGateRms) {
+                        std::fill(task->pcm.begin(), task->pcm.end(), 0);
+                        gate_suppressed_++;
+                    } else {
+                        gate_passed_++;
+                    }
+                }
                 std::vector<uint8_t> buf(encoder_outbuf_size_);
                 esp_audio_enc_in_frame_t in = {
                     .buffer = (uint8_t *)(task->pcm.data()),
@@ -495,6 +714,19 @@ void AudioService::OpusCodecTask() {
     }
 
     ESP_LOGW(TAG, "Opus codec task stopped");
+}
+
+void AudioService::SetUplinkSuppress(bool suppress) {
+    if (!suppress && (gate_suppressed_ > 0 || gate_passed_ > 0)) {
+        /* 每次关闭（AI 说完/被打断）打一条：如果 suppressed 为 0 = 门限
+           没拦到任何回声（说明残余回声 RMS 全部高于门限 → 门限值偏低，
+           服务器仍会误判）；passed 远大于 suppressed = 大量帧在放行。 */
+        ESP_LOGI(TAG, "uplink gate: suppressed=%u passed=%u (threshold check)",
+                 gate_suppressed_, gate_passed_);
+        gate_suppressed_ = 0;
+        gate_passed_ = 0;
+    }
+    uplink_suppress_.store(suppress);
 }
 
 void AudioService::SetDecodeSampleRate(int sample_rate, int frame_duration) {
@@ -586,6 +818,14 @@ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> pa
                     audio_decode_queue_.size() < MAX_DECODE_PACKETS_IN_QUEUE;
             });
         } else {
+            /* 2026-11-15 吞音定责：解码队列满（MAX_DECODE_PACKETS_IN_QUEUE =
+               2400ms）时这里**直接把这包音频丢掉**，听感就是"字被吃掉"。
+               以前完全静默，出问题时看不出来 —— 加计数，每 20 包打一条。 */
+            static uint32_t s_decode_drop = 0;
+            if (++s_decode_drop % 20 == 1) {
+                ESP_LOGW(TAG, "解码队列满，丢弃下行包（累计 %u 包 ≈ %.2fs 音频）",
+                         (unsigned)s_decode_drop, (double)s_decode_drop * 0.06);
+            }
             return false;
         }
     }
@@ -744,6 +984,22 @@ void AudioService::ResetDecoder() {
     bool notify_drained = false;
     {
         std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        /* 2026-11-15 吞音取证：这个函数会把还没播的音频整段扔掉。
+           以前完全静默 —— 用户报"最后一句话丢音"时无法确认是这个清掉的。
+           pending ≈ 剩余未播时长（60ms/包 + 已在播放队列里的 PCM 帧）。 */
+        const size_t pending = audio_decode_queue_.size() + audio_playback_queue_.size();
+        if (pending > 0) {
+            ESP_LOGW(TAG, "ResetDecoder 丢弃 %u 包未播音频（≈%ums）", (unsigned)pending,
+                     (unsigned)(pending * 60));
+        }
+        /* 2026-11-15 自适应抖动缓冲：新一轮开始前重新蓄水。
+           上一轮完全没断流就把目标收回去（-100ms），保持平时低延迟。 */
+        if (!jitter_turn_had_gap_ && jitter_target_ms_ > kJitterMinMs) {
+            jitter_target_ms_ = std::max(kJitterMinMs, jitter_target_ms_ - 100);
+        }
+        jitter_turn_had_gap_ = false;
+        jitter_priming_ = true;
+
         ++playback_generation_;
         std::unique_lock<std::mutex> decoder_lock(decoder_mutex_);
         if (opus_decoder_ != nullptr) {
@@ -792,6 +1048,29 @@ void AudioService::CheckAndUpdateAudioPowerState() {
     }
     if (!codec_->input_enabled() && !codec_->output_enabled()) {
         esp_timer_stop(audio_power_timer_);
+    }
+
+    // 内部 SRAM 是这台设备的硬约束：不够用时 esp-tls 会 select() "Not enough space"、
+    // MQTT 连不上、音频跟着爆音。这里把各音频任务的栈用量打出来，
+    // 好按真实用量把栈调到刚好够（high water mark = 历史最小剩余，越小越危险）。
+    static uint32_t s_dbg_ticks = 0;
+    if (++s_dbg_ticks == 30) {  // 启动 30 秒后各任务都跑过一轮了，采样最准
+        auto wm = [](TaskHandle_t h, const char* name, size_t total_bytes) {
+            if (h == nullptr) {
+                return;
+            }
+            const size_t left = uxTaskGetStackHighWaterMark(h) * sizeof(StackType_t);
+            ESP_LOGW(TAG, "stack %-12s used %4u / %u B", name, (unsigned)(total_bytes - left),
+                     (unsigned)total_bytes);
+        };
+        wm(audio_input_task_handle_, "audio_input", 2048 * 3);
+        wm(audio_output_task_handle_, "audio_output", 2048 * 2);
+        wm(opus_codec_task_handle_, "opus_codec", 2048 * 8);
+        if (TaskHandle_t t = xTaskGetHandle("taskLVGL"); t != nullptr) {
+            ESP_LOGW(TAG, "stack %-12s left %4u B", "taskLVGL",
+                     (unsigned)(uxTaskGetStackHighWaterMark(t) * sizeof(StackType_t)));
+        }
+        ESP_LOGW(TAG, "internal sram free %u KB", (unsigned)(esp_get_free_internal_heap_size() / 1024));
     }
 }
 

@@ -38,7 +38,11 @@
 
 #define OPUS_FRAME_DURATION_MS 60
 #define MAX_ENCODE_TASKS_IN_QUEUE 2
-#define MAX_PLAYBACK_TASKS_IN_QUEUE 2
+/* ⚠️ 2026-11-07 卡顿优化：2 帧 = 120ms 播放缓冲太浅 —— 音乐/对话都是云端
+   实时 opus 流，网络一抖（>120ms）解码队列跟不上，I2S DMA（60ms）一饿
+   就是爆音。提到 6 帧 = 360ms（加上 DMA 共约 420ms 抗抖动），代价是
+   TTS 起播多等约 0.3 秒 —— 远比中途卡顿可接受。 */
+#define MAX_PLAYBACK_TASKS_IN_QUEUE 6
 #define MAX_DECODE_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
 #define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
 #define AUDIO_TESTING_MAX_DURATION_MS 10000
@@ -125,6 +129,14 @@ public:
 
     void EnableWakeWordDetection(bool enable);
     void EnableVoiceProcessing(bool enable);
+
+    /* 2026-11-07 上行静音门限开关：AI 说话（speaking）时置 true，
+       编码层自动把 AEC 残余回声（低能量）滤成静音，防服务器 VAD 误打断。
+       关闭时打印命中统计（滤掉了几帧回声 / 放行了几帧真人声）。 */
+    void SetUplinkSuppress(bool suppress);
+
+    uint32_t gate_suppressed_ = 0;   /* 被门限滤掉的帧数（回声） */
+    uint32_t gate_passed_ = 0;       /* 门限放行的帧数（真人声/大声） */
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
 
@@ -178,6 +190,16 @@ private:
     bool output_in_flight_ = false;
     bool playback_drained_notified_ = true;
     uint32_t playback_generation_ = 0;
+
+    /* ── 2026-11-15 自适应抖动缓冲 ──
+       服务端按分片推流（一批 0.5~0.8s，批间隔 0.6~1.0s），固定 0.42s 缓冲
+       兜不住。每轮开口前先攒 jitter_target_ms_：断流一次 +200ms（上限 800），
+       整轮没断 -100ms（下限 200），平时靠 200ms 保持低延迟。 */
+    static constexpr int kJitterMinMs = 200;
+    static constexpr int kJitterMaxMs = 800;
+    int jitter_target_ms_ = kJitterMinMs;
+    bool jitter_priming_ = false;      // true = 本轮还没开口，正在蓄水
+    bool jitter_turn_had_gap_ = false; // 本轮是否发生过断流（用于自适应调整）
     // For server AEC
     std::deque<uint32_t> timestamp_queue_;
 
@@ -190,6 +212,7 @@ private:
 #endif
     std::atomic<bool> service_stopped_{true};
     std::atomic<bool> audio_input_need_warmup_{false};
+    std::atomic<bool> uplink_suppress_{false};   /* AI 说话时上行回声滤除开关 */
 
     esp_timer_handle_t audio_power_timer_ = nullptr;
     std::chrono::steady_clock::time_point last_input_time_;

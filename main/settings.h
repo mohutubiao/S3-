@@ -17,6 +17,10 @@ public:
     void SetBool(const std::string& key, bool value);
     void EraseKey(const std::string& key);
     void EraseAll();
+    /* 2026-11-10：立即落盘。⚠️ SetInt/SetString 只标 dirty_，
+       真正 nvs_commit 在析构里 —— 写完就 esp_restart() 会丢数据
+       （小车模式退出/语音切换全中过这个坑）。重启前必须显式调它。 */
+    void Commit();
 
 private:
     std::string ns_;

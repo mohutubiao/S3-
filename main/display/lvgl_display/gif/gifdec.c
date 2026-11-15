@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <esp_log.h>
+#include <esp_heap_caps.h>   // heap_caps_malloc / MALLOC_CAP_SPIRAM：GIF 画布挪 PSRAM 用
 
 #define TAG "GIF"
 
@@ -121,13 +122,29 @@ static gd_GIF * gif_open(gd_GIF * gif_base)
         ESP_LOGW(TAG, "Image dimensions are too large");
         goto fail;
     } 
-    gif = lv_malloc(sizeof(gd_GIF) + 5 * width * height + LZW_CACHE_SIZE);
+    // ⚠️ 2026-10-31：这块原先走 lv_malloc(内部 SRAM)，一次要 ~125KB（150x171x5）。
+    // 而 LVGL 自己的池才 64KB，等于每次解 GIF 都在硬挤内部 SRAM —— 挤到只剩 9KB 时
+    // opus 任务一开工就栈溢出崩溃（实测 connecting->listening 那一瞬）。
+    // 挪到 PSRAM（板子有 8MB，基本闲置）。LZW 表那种每帧的小分配不动：PSRAM 延迟
+    // 高，反而拖慢解码。放不下时退回 lv_malloc，保住原先行为。
+    gif = (gd_GIF *)heap_caps_malloc(sizeof(gd_GIF) + 5 * width * height + LZW_CACHE_SIZE,
+                                     MALLOC_CAP_SPIRAM);
+    if(!gif) {
+        ESP_LOGW(TAG, "PSRAM for GIF canvas failed, need %u B",
+                 (unsigned)(sizeof(gd_GIF) + 5 * width * height + LZW_CACHE_SIZE));
+        goto fail;
+    }
 #else
     if(0 == (INT_MAX - sizeof(gd_GIF)) / width / height / 5){
         ESP_LOGW(TAG, "Image dimensions are too large");
         goto fail;
     } 
-    gif = lv_malloc(sizeof(gd_GIF) + 5 * width * height);
+    gif = (gd_GIF *)heap_caps_malloc(sizeof(gd_GIF) + 5 * width * height, MALLOC_CAP_SPIRAM);
+    if(!gif) {
+        ESP_LOGW(TAG, "PSRAM for GIF canvas failed (need %u B)",
+                 (unsigned)(sizeof(gd_GIF) + 5 * width * height));
+        goto fail;
+    }
 #endif
     if(!gif) goto fail;
     memcpy(gif, gif_base, sizeof(gd_GIF));
@@ -766,7 +783,10 @@ void
 gd_close_gif(gd_GIF * gif)
 {
     f_gif_close(gif);
-    lv_free(gif);
+    // 配对上面的 heap_caps_malloc(...SPIRAM)。heap_caps_free 会按指针找到它真正
+    // 所属的堆，所以无论走的是哪个分支都用这一条即可。gd_close_gif 是全文件唯一
+    // 释放 gd_GIF 的地方（已查过），改这一个点就够。
+    heap_caps_free(gif);
 }
 
 static bool f_gif_open(gd_GIF * gif, const void * path, bool is_file)

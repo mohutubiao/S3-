@@ -135,18 +135,63 @@ SpiLcdDisplay::SpiLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
     ESP_LOGI(TAG, "Initialize LVGL port");
     lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
     port_cfg.task_priority = 1;
+    /* ⚠️ 2026-11-02 崩溃修复：LVGL 任务栈从默认 7168 加大到 16384。
+       现象：拔掉串口双击切主题必崩、插着串口基本不崩（串口耗时掩盖了问题）。
+       取证：addr2line 定位到 lv_obj_delete → lv_obj_destructor →
+       lv_event_mark_deleted()（lv_event.c:323）读地址 0x5 崩 LoadProhibited。
+       该函数 `while(e)` 已判非空仍读到垃圾值 → 全局事件链表节点被踩坏。
+       根因：切主题要递归删除约 28 个装饰对象 + 4 个 label，递归很深，
+       7KB 栈不够用，栈溢出踩坏了相邻内存（LVGL 的全局 event_head 链表）。
+       加大栈后不再溢出。多占 9KB 内部 RAM，实测堆内存仍有余量。 */
+    /* 2026-11-02 二轮：16KB 下仍「偶尔崩」，再加到 24KB。
+       同时已在 dafeiyu_display 里记录栈最低水位到 RTC 内存（panic 后仍可读），
+       崩一次就能在 /api/state 的 wake 字段看到栈到底剩多少，据此判断够不够。 */
+    /* 2026-11-02 回退：24KB 实测把堆挤到 minimal sram=499（几乎 OOM），
+       导致音频/唤醒词分配不到内存（语音无法唤醒、听不到说话），
+       双击切主题也因分配失败而崩。回到 16KB —— 该配置下 minimal sram=21591。 */
+    port_cfg.task_stack = 16384;
 #if CONFIG_SOC_CPU_CORES_NUM > 1
     port_cfg.task_affinity = 1;
 #endif
     lvgl_port_init(&port_cfg);
 
     ESP_LOGI(TAG, "Adding LCD display");
+
+    // SPI 屏刷一帧要调 vres/lines 次 draw_bitmap()，每次都有 DMA 启动 + 等待开销。
+    // 原来 20 行 + 无双缓冲：240/20 = 12 次串行调用，渲染时 DMA 只能干等，
+    // 这段"CPU 不着活但占着总线"的时间会挤掉 I2S 音频 DMA，表现为爆音卡顿。
+    // 这里按可用 DMA 内存尽量加行 + 开双缓冲（渲染下一块时 DMA 能同时传当前块），
+    // 分配不出来就自动降级回保守配置，不死机。
+    uint32_t lines = 20;
+    bool use_double = false;
+#if defined(CONFIG_BOARD_TYPE_ZHENGCHEN_CAM)
+    lines = 40;
+    use_double = true;
+#endif
+    auto need_bytes = [&]() -> size_t {
+        return static_cast<size_t>(width_) * lines * 2 * (use_double ? 2 : 1);
+    };
+    // 实测这台设备内部 SRAM 最小只剩 400 字节左右，40 行双缓冲（约 50KB）根本
+    // 分配不出来 —— 所以降级路径才是常态，别指望它真能加成。保留这段只是让配置
+    // 跟着可用内存走而不是写死，内存紧张时至少不会分配失败把屏搞黑。
+    while (heap_caps_get_largest_free_block(MALLOC_CAP_DMA) < need_bytes() + 4096) {
+        if (lines > 20) {
+            lines /= 2;  // 先砍行数
+        } else if (use_double) {
+            use_double = false;
+        } else {
+            break;
+        }
+    }
+    ESP_LOGW(TAG, "LVGL draw buf: %u lines x%s = %.1fKB DMA", static_cast<unsigned>(lines),
+             use_double ? "2" : "1", need_bytes() / 1024.0f);
+
     const lvgl_port_display_cfg_t display_cfg = {
         .io_handle = panel_io_,
         .panel_handle = panel_,
         .control_handle = nullptr,
-        .buffer_size = static_cast<uint32_t>(width_ * 20),
-        .double_buffer = false,
+        .buffer_size = static_cast<uint32_t>(width_ * lines),
+        .double_buffer = use_double,
         .trans_size = 0,
         .hres = static_cast<uint32_t>(width_),
         .vres = static_cast<uint32_t>(height_),

@@ -11,6 +11,9 @@
 #include <esp_network.h>
 #include <esp_log.h>
 #include <esp_mac.h>
+#include <esp_netif.h>
+#include <esp_wifi.h>
+#include <lwip/netdb.h>
 #include <utility>
 
 #include <material_symbols.h>
@@ -25,6 +28,140 @@ static const char *TAG = "WifiBoard";
 
 // Connection timeout in seconds
 static constexpr int CONNECT_TIMEOUT_SEC = 60;
+
+/* ── 2026-11-15 静态 IP（修：以前从来没生效过）────────────────────────────
+   原来在 WifiManager.Initialize() 之后立刻查 netif 并设置，但 STA netif 是
+   WifiStation::Start() 里才创建的 → 永远拿到 nullptr，日志「STA netif 还没建好」，
+   实际一直走 DHCP。实测 DHCP 要 5.8 秒才拿到地址（1720ms 开始扫描 → 9880ms
+   才 Got IP），开机到可用 11.3 秒里有 5.8 秒耗在这。
+   现在两条腿：
+     ① 一次性任务轮询 netif（10ms × 最多 300 次），建好就停 DHCP + 钉死地址；
+     ② 注册 STA_CONNECTED 兜底再设一次，并**手动补发 IP_EVENT_STA_GOT_IP** ——
+        静态 IP 不走 DHCP，不会自动产生这个事件，不补的话上层永远认为没联网。
+   地址挑 .50：家用路由 DHCP 池一般 .100~.199，池外不会撞车。
+   想换地址只改下面四个数字。 */
+namespace {
+
+constexpr int kStaticIp[4]   = {192, 168, 1, 50};
+constexpr int kStaticGw[4]   = {192, 168, 1, 1};
+constexpr int kStaticMask[4] = {255, 255, 255, 0};
+
+// 幂等：netif 不存在时返回 false，调用方自己决定重试/放弃
+bool ApplyStaticIp() {
+    esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif == nullptr) {
+        return false;
+    }
+    esp_netif_ip_info_t ip_info = {};
+    IP4_ADDR(&ip_info.ip, kStaticIp[0], kStaticIp[1], kStaticIp[2], kStaticIp[3]);
+    IP4_ADDR(&ip_info.gw, kStaticGw[0], kStaticGw[1], kStaticGw[2], kStaticGw[3]);
+    IP4_ADDR(&ip_info.netmask, kStaticMask[0], kStaticMask[1], kStaticMask[2], kStaticMask[3]);
+
+    // 必须先停 DHCP，否则它拿到的地址会把静态地址覆盖掉。
+    // 已经停了会返回错误，属正常，忽略。
+    esp_netif_dhcpc_stop(netif);
+    if (esp_netif_set_ip_info(netif, &ip_info) != ESP_OK) {
+        return false;
+    }
+
+    /* ⚠️ 2026-11-15 踩坑：静态 IP 只设 IP/网关/掩码，**DNS 是空的** ——
+       DNS 平时由 DHCP 下发，停掉 DHCP 后域名一个都解析不了，
+       表现就是「WiFi 连上了、网页能开、但连不上服务器」。
+       主 DNS 用网关（家用路由通常自己代理 DNS），备用走阿里公共 DNS。 */
+    esp_netif_dns_info_t dns_main = {};
+    IP_ADDR4(&dns_main.ip, kStaticGw[0], kStaticGw[1], kStaticGw[2], kStaticGw[3]);
+    esp_netif_set_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns_main);
+
+    esp_netif_dns_info_t dns_backup = {};
+    IP_ADDR4(&dns_backup.ip, 223, 5, 5, 5);
+    esp_netif_set_dns_info(netif, ESP_NETIF_DNS_BACKUP, &dns_backup);
+    return true;
+}
+
+/* 兜底：静态 IP 配置错（换网络 / 网关不是 192.168.1.1）时，DNS 会全挂，
+   设备表现为「WiFi 连上、网页能开、就是连不上服务器」。
+   连上 20 秒后测一次域名解析，失败就退掉静态 IP、重新走 DHCP 并重连，
+   宁可 IP 变回动态也不要变成哑巴。 */
+/* ⚠️ 2026-11-15 踩坑：任务函数**绝不能 return**！
+   FreeRTOS 的任务入口返回地址是 0，return 后 CPU 跳到 0x0，
+   表现为 `Guru Meditation Error (IllegalInstruction)` + `A0 = 0x00000000`，
+   而且是每 20 秒（本任务的 vTaskDelay）崩一次，看起来像"唤醒就重启"。
+   所有出口必须 vTaskDelete(nullptr) 后再返回。 */
+void StaticIpHealthTask(void*) {
+    vTaskDelay(pdMS_TO_TICKS(20000));
+    esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif == nullptr || !esp_netif_is_netif_up(netif)) {
+        vTaskDelete(nullptr);        // 还没联网，不误判
+        return;
+    }
+    struct addrinfo hints = {};
+    hints.ai_family = AF_INET;
+    struct addrinfo* res = nullptr;
+    const int err = getaddrinfo("api.tenclass.net", nullptr, &hints, &res);
+    if (res != nullptr) {
+        freeaddrinfo(res);
+    }
+    if (err == 0) {
+        ESP_LOGI(TAG, "静态 IP 自检通过（域名解析正常）");
+        vTaskDelete(nullptr);
+        return;
+    }
+    ESP_LOGE(TAG, "静态 IP 下域名解析失败(err=%d)，回退 DHCP 并重连", err);
+    esp_netif_dhcpc_start(netif);
+    esp_wifi_disconnect();
+    esp_wifi_connect();
+    vTaskDelete(nullptr);
+}
+
+void StaticIpEventHandler(void*, esp_event_base_t base, int32_t id, void*) {
+    if (base != WIFI_EVENT || id != WIFI_EVENT_STA_CONNECTED) {
+        return;
+    }
+    esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (netif == nullptr || !ApplyStaticIp()) {
+        ESP_LOGE(TAG, "静态 IP 兜底设置失败，回退 DHCP");
+        if (netif != nullptr) {
+            esp_netif_dhcpc_start(netif);
+        }
+        return;
+    }
+    esp_netif_ip_info_t ip_info = {};
+    if (esp_netif_get_ip_info(netif, &ip_info) != ESP_OK) {
+        return;
+    }
+    ip_event_got_ip_t evt = {};
+    evt.esp_netif = netif;
+    evt.ip_info = ip_info;
+    evt.ip_changed = true;
+    esp_event_post(IP_EVENT, IP_EVENT_STA_GOT_IP, &evt, sizeof(evt), 0);
+    ESP_LOGI(TAG, "静态 IP 生效: " IPSTR, IP2STR(&ip_info.ip));
+
+    /* 只起一次自检（重连时事件还会再来，不要重复起任务） */
+    static bool health_started = false;
+    if (!health_started) {
+        health_started = true;
+        xTaskCreate(StaticIpHealthTask, "static_ip_check", 4096, nullptr, 3, nullptr);
+    }
+}
+
+void StaticIpPollTask(void*) {
+    for (int i = 0; i < 300; ++i) {          // 最多等 3 秒
+        if (ApplyStaticIp()) {
+            esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+            esp_netif_ip_info_t ip_info = {};
+            if (netif != nullptr && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
+                ESP_LOGI(TAG, "静态 IP 已钉死: " IPSTR, IP2STR(&ip_info.ip));
+            }
+            vTaskDelete(nullptr);
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    ESP_LOGW(TAG, "静态 IP：3 秒内没等到 STA netif，继续走 DHCP");
+    vTaskDelete(nullptr);
+}
+
+}  // namespace
 
 WifiBoard::WifiBoard() {
     // Create connection timeout timer
@@ -92,6 +229,20 @@ void WifiBoard::StartNetwork() {
                 break;
         }
     });
+
+    // ⚠️ 2026-10-31：这台机器人固定摆在桌上，DHCP 每次重启都换个地址，结果就是
+    // 「明明活着却按老地址连不上」，还会让人误以为是重启死机。
+    // 2026-11-15 修：原来在这里直接设置，但 netif 还没建（WifiStation::Start 里才建），
+    // 一直静默失败走 DHCP。改成轮询任务 + STA_CONNECTED 兜底，见文件头注释。
+    {
+        static bool static_ip_hooked = false;
+        if (!static_ip_hooked) {
+            static_ip_hooked = true;
+            esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_CONNECTED,
+                                       &StaticIpEventHandler, nullptr);
+            xTaskCreate(StaticIpPollTask, "static_ip", 3072, nullptr, 5, nullptr);
+        }
+    }
 
     // Try to connect or enter config mode
     TryWifiConnect();

@@ -19,7 +19,9 @@
 #include <atomic>
 
 #define MQTT_PING_INTERVAL_SECONDS 90
-#define MQTT_RECONNECT_INTERVAL_MS 60000
+/* ⚠️ 2026-11-07：60s → 10s。用户实测「放一会音乐就连不上服务器」——
+   断线后干等 60 秒体验极差，10 秒内自动回来。 */
+#define MQTT_RECONNECT_INTERVAL_MS 10000
 
 #define MQTT_PROTOCOL_SERVER_HELLO_EVENT (1 << 0)
 
@@ -52,6 +54,10 @@ private:
     int udp_port_;
     uint32_t local_sequence_;
     uint32_t remote_sequence_;
+    /* 2026-11-07 卡顿修复：UDP 乱序重排窗 —— 迟到的包先在这里等一等，
+       缺口确认丢了才放弃（补静音帧）。实测对话期间 ~22% 包丢/乱序，
+       旧逻辑把乱序包直接当丢包扔了。 */
+    std::map<uint32_t, std::unique_ptr<AudioStreamPacket>> reorder_buf_;
     esp_timer_handle_t reconnect_timer_;
 
     bool StartMqttClient(bool report_error=false);

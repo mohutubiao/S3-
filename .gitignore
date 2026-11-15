@@ -18,3 +18,24 @@ main/mmap_generate_emoji.h
 *.bin
 mmap_generate_*.h
 .clangd
+
+# ── 2026-11-15 开源整理 ──────────────────────────────────────────
+# 根目录下的本机调试产物：下划线开头的脚本/日志/截图（固件烧录抓的串口日志等）
+/_*.py
+/_*.log
+/_*.out
+/_*.ps1
+/_*.bat
+/_*.txt
+/_*.html
+/*.log
+# 根目录素材源与临时工作目录（注意：main/assets 是运行时资源，不能排除）
+/_*/
+/assets/
+# 板级工作副本
+main/boards/zhengchen/cam/_wip/
+# 含本机路径 / 个人信息的笔记
+CODEBUDDY.md
+S3成品板-工程说明.md
+_音频方案笔记_20261108.md
+参考-二驴子交接说明.md

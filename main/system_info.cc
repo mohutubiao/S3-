@@ -150,7 +150,12 @@ void SystemInfo::PrintTaskList() {
 void SystemInfo::PrintHeapStats() {
     int free_sram = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     int min_free_sram = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
-    ESP_LOGI(TAG, "free sram: %u minimal sram: %u", free_sram, min_free_sram);
+    /* 2026-11-13：加最大连续块。只看 free 会误判 ——
+       httpd 的 select() 失败是 ENOMEM(12)，但 free 还有 7KB，
+       真正原因是最大连续块太小（碎片化）。这两个数必须一起看。 */
+    int largest = (int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    ESP_LOGI(TAG, "free sram: %u minimal sram: %u largest: %u",
+             free_sram, min_free_sram, largest);
 }
 
 void SystemInfo::PrintPmLocks() {

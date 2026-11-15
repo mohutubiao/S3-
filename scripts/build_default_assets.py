@@ -711,6 +711,17 @@ def get_emoji_collection_path(default_emoji_collection, noto_fonts_path, project
     if not default_emoji_collection:
         return None
     
+    # Special handling for project-local collections (e.g. dafeiyu pet animation)
+    if default_emoji_collection == 'dafeiyu':
+        if project_root:
+            pet_path = os.path.join(project_root, 'assets', 'dafeiyu')
+            if os.path.exists(pet_path):
+                return pet_path
+            print(f"Warning: dafeiyu asset directory not found: {pet_path}")
+            return None
+        print("Warning: project_root not provided, cannot locate dafeiyu collection")
+        return None
+
     # Special handling for otto-gif collection
     if default_emoji_collection == 'otto-gif':
         if project_root:
@@ -812,6 +823,10 @@ def main():
     parser.add_argument('--esp_sr_model_path', help='Path to ESP-SR model directory')
     parser.add_argument('--noto_fonts_path', help='Path to noto-fonts component directory')
     parser.add_argument('--extra_files', help='Path to extra files directory to be included in assets')
+    parser.add_argument('--extra_wakenet_models',
+                        help='Additional wakenet models to pack, comma separated (e.g. wn9_hiesp,wn9_alexa)')
+    parser.add_argument('--extra_multinet_models',
+                        help='Additional multinet models to pack, comma separated (e.g. mn5q8_cn)')
     
     args = parser.parse_args()
     
@@ -862,6 +877,28 @@ def main():
     elif multinet_model_names:
         print(f"  Note: Found multinet models {multinet_model_names} but USE_CUSTOM_WAKE_WORD is disabled, skipping")
     
+    # 4. 额外打包的模型（由项目 CMakeLists 的 WAKE_WORD_EXTRA_MODELS 传入）
+    #    用途：让网页能在多个内置唤醒词之间选，并支持 Multinet 自定义词。
+    #    这些模型只进 assets 分区，不进固件（实测多选后 app 体积不变）。
+    extra_wakenets = [m.strip() for m in (args.extra_wakenet_models or '').split(',') if m.strip()]
+    extra_multinets = [m.strip() for m in (args.extra_multinet_models or '').split(',') if m.strip()]
+
+    for name in extra_wakenets:
+        if name in wakenet_model_names:
+            continue
+        paths = get_wakenet_model_paths([name], args.esp_sr_model_path)
+        if paths:
+            wakenet_model_paths.extend(paths)
+            wakenet_model_names.append(name)
+
+    for name in extra_multinets:
+        if name in multinet_model_names:
+            continue
+        paths = get_multinet_model_paths([name], args.esp_sr_model_path)
+        if paths:
+            multinet_model_paths.extend(paths)
+            multinet_model_names.append(name)
+
     # Print model information (only for models that will actually be packaged)
     if wakenet_model_paths:
         print(f"  wakenet models: {', '.join(wakenet_model_names)} (will be packaged)")
@@ -911,6 +948,23 @@ def main():
         print(f"  custom wake word: {custom_wake_word_config['wake_word']} ({custom_wake_word_config['display']})")
         print(f"  wake word language: {language}")
         print(f"  wake word threshold: {custom_wake_word_config['threshold']}")
+
+    # 没启用 USE_CUSTOM_WAKE_WORD 但打包了 Multinet 时，也要写一份默认命令词：
+    # 设备端 CustomWakeWord 从 index.json 读命令词，网页上改的词会在 NVS 里覆盖它。
+    if multinet_model_paths and not multinet_model_info:
+        multinet_model_info = {
+            "language": get_language_from_multinet_models(multinet_model_names),
+            "duration": 3000,
+            "threshold": 0.2,
+            "commands": [
+                {
+                    "command": "xiao tu dou",
+                    "text": "小土豆",
+                    "action": "wake"
+                }
+            ]
+        }
+        print("  custom wake word (default): xiao tu dou (小土豆)")
     
     # Check if we have anything to build
     if not wakenet_model_paths and not multinet_model_paths and not text_font_path and not emoji_collection_path and not extra_files_path and not multinet_model_info:

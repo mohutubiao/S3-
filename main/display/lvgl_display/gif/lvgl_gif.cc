@@ -169,6 +169,11 @@ void LvglGif::SetFrameCallback(std::function<void()> callback) {
     frame_callback_ = callback;
 }
 
+void LvglGif::SetFrameSkip(uint32_t skip) {
+    frame_skip_ = skip;
+    frame_counter_ = 0;
+}
+
 void LvglGif::NextFrame() {
     if (!loaded_ || !gif_ || !playing_) {
         return;
@@ -193,6 +198,14 @@ void LvglGif::NextFrame() {
     }
 
     last_call_ = lv_tick_get();
+
+    // 跳帧：跳过时既不解码也不刷新，直接等下一帧时间到
+    if (frame_skip_ > 0) {
+        frame_counter_++;
+        if (frame_counter_ % (frame_skip_ + 1) != 0) {
+            return;
+        }
+    }
 
     // Save file position before getting next frame to detect loop
     uint32_t pos_before = gif_->f_rw_p;

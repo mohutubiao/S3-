@@ -5,12 +5,20 @@
 #include "system_info.h"
 
 #include <esp_log.h>
+#include <esp_timer.h>       // 2026-11-15 记录最后一包到达时刻（跨模块定责）
+#include <esp_wifi.h>        // 2026-11-15 卡音定责：读 AP 信息取 rssi
 #include <arpa/inet.h>
 #include <cJSON.h>
 #include <cstring>
+#include <chrono>            // 2026-11-07 下行流 gap 统计
 #include "assets/lang_config.h"
 
 #define TAG "WS"
+
+/* 2026-11-15 跨模块诊断出口：最后一包下行音频到达的单调毫秒。
+   audio_service.cc 的 AudioOutputTask 拿它给"输出断档"定责 ——
+   断档时上游刚来过包 = 设备端 stall；上游也没包 = 上游断供。 */
+uint32_t g_ws_last_audio_arrival_ms = 0;
 
 WebsocketProtocol::WebsocketProtocol() { event_group_handle_ = xEventGroupCreate(); }
 
@@ -80,10 +88,15 @@ bool WebsocketProtocol::OpenAudioChannel() {
     Settings settings("websocket", false);
     std::string url = settings.GetString("url");
     std::string token = settings.GetString("token");
-    int version = settings.GetInt("version");
-    if (version != 0) {
-        version_ = version;
-    }
+    /* ⚠️ 2026-11-07 强制协议 v1（终极对照实验）：A/B 对照铁证 ——
+       同网络同一首放歌，C3 板（老固件，协议 v1）完全流畅零断声；
+       S3（服务器 OTA 下发 v2/v3 新二进制协议）实测 ws audio stats
+       每 ~2 秒一个到达 gap（pkts=1600 gaps=58），听感 1-2 秒没声，
+       且播放管线 starve 0%（洞在收到的数据里，设备无责）。
+       结论：服务器对新协议设备的音频出流有洞。降回 v1 与 C3 走
+       同一条服务路径。若服务器行为确认如此，v1 就是本板的最优解。 */
+    int version = 1;   // 服务器下发值：settings.GetInt("version")
+    version_ = version;
 
     error_occurred_ = false;
 
@@ -107,6 +120,69 @@ bool WebsocketProtocol::OpenAudioChannel() {
 
     websocket_->OnData([this](const char* data, size_t len, bool binary) {
         if (binary) {
+            /* ── 2026-11-07 下行流判定仪表：WS 版一直缺 MQTT 版的链路统计，
+               AI 断续时看不清下行数据流形态。每 100 包打一条：
+               · gaps = 相邻包间隔 >150ms 次数（音频 60ms 一包，正常应稳如时钟；
+                 gap 多 = 服务器/网络出流一阵一阵 → 断声的元凶）；
+               · drops = WS 层把包交给回调但连接已不在（连接断前丢的包）。
+               判读：gaps 高 → 上游出流问题；gaps≈0 还断 → 设备端。 */
+            /* 2026-11-15 卡音追查：只有 gaps 计数不够 —— 200ms 的 gap 和 1500ms
+               的 gap 听感天差地别（前者是抖一下，后者是"整句没声"）。加 gapmax
+               记录本窗口内最大到达间隔，并每窗口清零，直接看出断多久。
+               rssi 一起打：<-70dBm 时先怀疑网络，别去改设备代码。 */
+            static uint32_t ws_pkts = 0, ws_gaps = 0, ws_bytes = 0, ws_gapmax = 0, ws_silent = 0;
+            static auto ws_last_arrival = std::chrono::steady_clock::now();
+            auto arrival = std::chrono::steady_clock::now();
+            if (ws_pkts > 0) {
+                auto gap_ms =
+                    (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(arrival - ws_last_arrival).count();
+                if (gap_ms > 2000) {
+                    /* >2s 基本是对话静默（说完等回答），不是出流洞，别污染 gapmax */
+                    ws_silent++;
+                } else {
+                    if (gap_ms > 150) {
+                        ws_gaps++;
+                    }
+                    if (gap_ms > ws_gapmax) {
+                        ws_gapmax = gap_ms;
+                    }
+                }
+                /* ── 2026-11-15 断流定责：断流后的包是「涌进来」还是「接着走」？
+                   两种可能听感一样，修法完全相反：
+                   · 服务器压根没产出 → 断 ~1.9s 后按正常 60ms 节奏继续，100ms 内只有 1~2 包；
+                   · 被积压（TCP 重传 / AP 缓冲 / 路由器排队）→ 断流期间的数据憋在链路里，
+                     一到就 100ms 内涌进十几~几十包。
+                   判读阈值取 5：60ms 一包时 100ms 正常最多 2 包，>5 只能是积压。 */
+                static uint32_t burst_last_gap = 0, burst_n = 0;
+                static bool burst_track = false;
+                static std::chrono::steady_clock::time_point burst_start;
+                if (gap_ms > 500) {
+                    burst_last_gap = gap_ms;
+                    burst_n = 0;
+                    burst_start = arrival;
+                    burst_track = true;
+                } else if (burst_track) {
+                    burst_n++;
+                }
+                if (burst_track &&
+                    std::chrono::duration_cast<std::chrono::milliseconds>(arrival - burst_start).count() >= 100) {
+                    ESP_LOGW(TAG, "ws 断流 %ums 后 100ms 内收到 %u 包（>5 = 链路积压/TCP 重传；1~2 = 服务器没发）",
+                             (unsigned)burst_last_gap, (unsigned)burst_n);
+                    burst_track = false;
+                }
+            }
+            ws_last_arrival = arrival;
+            g_ws_last_audio_arrival_ms = (uint32_t)(esp_timer_get_time() / 1000);
+            ws_pkts++;
+            ws_bytes += len;
+            if (ws_pkts % 100 == 0) {
+                wifi_ap_record_t ap{};
+                int rssi = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) ? (int)ap.rssi : 0;
+                ESP_LOGI(TAG, "ws audio stats: pkts=%u gaps=%u gapmax=%ums silent=%u bytes=%u rssi=%d",
+                         ws_pkts, ws_gaps, (unsigned)ws_gapmax, (unsigned)ws_silent, (unsigned)ws_bytes, rssi);
+                ws_gapmax = 0;
+                ws_silent = 0;
+            }
             if (on_incoming_audio_ != nullptr) {
                 if (version_ == 2) {
                     BinaryProtocol2* bp2 = (BinaryProtocol2*)data;
@@ -204,6 +280,13 @@ std::string WebsocketProtocol::GetHelloMessage() {
 #if CONFIG_USE_SERVER_AEC
     cJSON_AddBoolToObject(features, "aec", true);
 #endif
+    /* 2026-11-07：v1 对齐 C3 老固件 —— 曾把 mcp 声明限制在 v2+，
+       避免服务器按新特性路径出流。
+       2026-11-11 修正：v1 下不上报 mcp → 服务端不发 MCP initialize，
+       整条工具链（self.led.set / self.camera.take_photo）全部失效，
+       日志里连「未下发 vision 能力」都不出现，AI 只能凭空编造。
+       features 只是 JSON 能力协商，音频帧格式仍由 version 决定（v1 不变），
+       故改为无条件上报。若音频回到每 2 秒断声，把 mcp 声明夹回 v2+ 即可。 */
     cJSON_AddBoolToObject(features, "mcp", true);
     cJSON_AddItemToObject(root, "features", features);
     AddTextFontCapabilities(root);

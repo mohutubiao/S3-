@@ -1,6 +1,7 @@
 #include "afe_audio_engine.h"
 
 #include <cassert>
+#include <cmath>          // 2026-11-15 待机麦克风 RMS 仪表
 #include <cstring>
 #include <sstream>
 
@@ -8,8 +9,10 @@
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <esp_vadn_models.h>
+#include <freertos/idf_additions.h>   // xTaskCreateWithCaps / vTaskDeleteWithCaps
 
 #include "audio_service.h"
+#include "wake_word_models.h"
 #include "wake_words/custom_wake_word.h"
 
 #define TAG "AfeAudioEngine"
@@ -19,6 +22,19 @@ static constexpr bool kUseAfeForVoiceProcessing = true;
 #else
 static constexpr bool kUseAfeForVoiceProcessing = false;
 #endif
+
+/* 2026-11-15 唤醒灵敏度（内置词）：
+   内置唤醒词（WakeNet）此前完全用模型出厂门限 —— 开机日志
+   `wakenet9l_tts1h8_你好小智_3_0.631_0.635, mode:0` 里的 0.631 就是它
+   （mode:0 = DET_MODE_90）。用户实测要靠近/提嗓门才醒。
+   esp-sr 的 set_wakenet_threshold 支持 0.40~0.9999 覆盖出厂值，
+   **越小越灵敏**。
+   取值经过一轮实测：0.55 时用户报「待机无故自己进对话」，日志对上
+   `Wake word detected: 你好小智 (state: 3)`（state 3 = idle，排除播放
+   回声），而静置 60s（环境只有 20~360 RMS）零误唤醒 —— 说明是有声音
+   时被误认，灵敏度越界了。现取 0.60：介于出厂 0.631 与过灵敏的 0.55。
+   ⚠️ 这是唯一旋钮：仍误唤醒 → 往上 0.63~0.66；又难叫 → 往下 0.58。 */
+static constexpr float kWakeNetThreshold = 0.60f;
 
 AfeAudioEngine::AfeAudioEngine() {
     event_group_ = xEventGroupCreate();
@@ -65,15 +81,47 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms, srmode
 
     char* wakenet_model_name = nullptr;
     char* multinet_model_name = nullptr;
+    std::vector<std::string> wakenets;
     if (models_ != nullptr && models_->num > 0) {
-        wakenet_model_name = esp_srmodel_filter(models_, ESP_WN_PREFIX, nullptr);
-        multinet_model_name = esp_srmodel_filter(models_, ESP_MN_PREFIX, nullptr);
         for (int i = 0; i < models_->num; ++i) {
             ESP_LOGI(TAG, "Model %d: %s", i, models_->model_name[i]);
+            if (strncmp(models_->model_name[i], ESP_WN_PREFIX, strlen(ESP_WN_PREFIX)) == 0) {
+                wakenets.push_back(models_->model_name[i]);
+            }
         }
+        multinet_model_name = esp_srmodel_filter(models_, ESP_MN_PREFIX, nullptr);
+
+        /* 用户在网页上选的词（存 NVS，重启生效）。没选过/选中的不在镜像里，
+           都回退到第一个内置词，保证一定能唤醒。 */
+        const std::string want = wakeword::GetMode();
+        if (!want.empty() && want != "custom") {
+            wakenet_model_name = esp_srmodel_filter(models_, ESP_WN_PREFIX, want.c_str());
+            if (wakenet_model_name == nullptr) {
+                ESP_LOGW(TAG, "选中唤醒词 %s 不在 assets 里，回退第一个内置词", want.c_str());
+            }
+        }
+        if (wakenet_model_name == nullptr) {
+            /* 没选过：优先 sdkconfig 那个（小智），别让 srmodels.bin 的字母序决定默认 */
+            const std::string factory = wakeword::FactoryDefaultWakenet();
+            if (!factory.empty()) {
+                wakenet_model_name = esp_srmodel_filter(models_, ESP_WN_PREFIX, factory.c_str());
+            }
+        }
+        if (wakenet_model_name == nullptr) {
+            wakenet_model_name = esp_srmodel_filter(models_, ESP_WN_PREFIX, nullptr);
+        }
+        wakeword::RegisterAvailable(wakenets, multinet_model_name != nullptr);
+        ESP_LOGI(TAG, "唤醒词: %s（内置可选 %d 个, Multinet %s）",
+                 wakenet_model_name ? wakenet_model_name : "无",
+                 (int)wakenets.size(), multinet_model_name ? "有" : "无");
     }
 
-    if (multinet_model_name != nullptr) {
+    /* 自定义词（MultiNet）优先条件：assets 里有 Multinet 模型，
+       且用户选了 custom，或镜像里压根没有内置词。 */
+    const bool use_custom = (multinet_model_name != nullptr) &&
+                            (wakeword::GetMode() == "custom" || wakenet_model_name == nullptr);
+
+    if (use_custom) {
         wake_detector_ = WakeDetector::kMultiNet;
         custom_wake_word_ = std::make_unique<CustomWakeWord>();
         custom_wake_word_->OnWakeWordDetected([this](const std::string& wake_word) {
@@ -146,6 +194,10 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms, srmode
     afe_config->wakenet_model_name = wake_detector_ == WakeDetector::kWakeNet
         ? wakenet_model_name
         : nullptr;
+    /* ⚠️ 2026-11-07 回退：AGC 实验 ❌ —— 开了之后用户持续报「AI 回话
+       一段一段断」。机理：AGC 把 AEC 消不净的喇叭残余回声也放大了，
+       上行到服务器，服务器 VAD 误判用户在说话 → 反复打断 TTS → 碎段。
+       灵敏度改由「阈值 20→12」承担，AGC 保持关。 */
     afe_config->agc_init = false;
     afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
 
@@ -164,17 +216,30 @@ bool AfeAudioEngine::Initialize(AudioCodec* codec, int frame_duration_ms, srmode
 
     if (wake_detector_ == WakeDetector::kWakeNet) {
         afe_iface_->disable_wakenet(afe_data_);
+        /* 2026-11-15：把内置词的判定门限从模型出厂值（你好小智 0.631）
+           压到 kWakeNetThreshold，失败也继续跑（有版本该函数指针为 NULL）。 */
+        if (afe_iface_->set_wakenet_threshold != nullptr) {
+            int ret = afe_iface_->set_wakenet_threshold(afe_data_, 1, kWakeNetThreshold);
+            ESP_LOGI(TAG, "内置词唤醒阈值 %.3f（出厂约 0.631），设置结果 %d", kWakeNetThreshold, ret);
+        } else {
+            ESP_LOGW(TAG, "当前 esp-sr 无 set_wakenet_threshold，唤醒阈值保持出厂值");
+        }
     }
     if (codec_->input_reference()) {
         afe_iface_->disable_aec(afe_data_);
     }
     afe_iface_->print_pipeline(afe_data_);
 
-    BaseType_t task_created = xTaskCreate([](void* arg) {
+    /* 2026-11-11：内部 SRAM 只剩 ~33KB 时，AFE 主体创建后连这 4KB 任务栈都
+       分不出来（日志 "Failed to create AFE processing task"，随后唤醒全废）。
+       项目已开 CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY，把栈挪到 PSRAM：
+       省出 4KB 内部 RAM，代价是该任务栈访问偶有 cache miss。
+       ⚠️ 用 WithCaps 创建就必须用 vTaskDeleteWithCaps 删除，否则栈不回收。 */
+    BaseType_t task_created = xTaskCreateWithCaps([](void* arg) {
         auto* engine = static_cast<AfeAudioEngine*>(arg);
         engine->ProcessingTask();
-        vTaskDelete(nullptr);
-    }, "audio_afe", 4096, this, 3, &processing_task_);
+        vTaskDeleteWithCaps(nullptr);
+    }, "audio_afe", 4096, this, 3, &processing_task_, MALLOC_CAP_SPIRAM);
     if (task_created != pdPASS) {
         ESP_LOGE(TAG, "Failed to create AFE processing task");
         afe_iface_->destroy(afe_data_);
@@ -204,6 +269,34 @@ void AfeAudioEngine::Feed(std::vector<int16_t>&& data) {
     if ((xEventGroupGetBits(event_group_) & kAfeActive) == 0) {
         return;
     }
+
+    /* 2026-11-15 唤醒排查仪表：待机检测唤醒词时，每 5 秒打一次窗口内峰值 RMS。
+       判读（16bit PCM）：正常说话 800~3000；隔房间/背对设备 200~600；
+       只有几十 → 声音压根没进来，先查麦克风/输入增益/接线，别再调阈值。
+       注：AFE 自带的 data_volume 在 VC 模式下无效，所以自己算。 */
+    if (bits & kWakeWordEnabled) {
+        static double s_peak = 0;
+        static int64_t s_t0 = 0;
+        if (!data.empty()) {
+            double sum = 0;
+            for (int16_t s : data) {
+                sum += static_cast<double>(s) * static_cast<double>(s);
+            }
+            double rms = std::sqrt(sum / static_cast<double>(data.size()));
+            if (rms > s_peak) {
+                s_peak = rms;
+            }
+        }
+        int64_t now = esp_timer_get_time();
+        if (s_t0 == 0) {
+            s_t0 = now;
+        } else if (now - s_t0 >= 5 * 1000 * 1000) {
+            ESP_LOGI(TAG, "待机麦克风峰值 RMS=%.0f（<200 = 声音没进来，先查麦克风/增益）", s_peak);
+            s_peak = 0;
+            s_t0 = now;
+        }
+    }
+
     input_buffer_.insert(input_buffer_.end(), data.begin(), data.end());
     size_t chunk_size = afe_iface_->get_feed_chunksize(afe_data_) * codec_->input_channels();
     while (input_buffer_.size() >= chunk_size) {
@@ -324,8 +417,14 @@ void AfeAudioEngine::ApplyAfeControls() {
         }
     }
     if (codec_->input_reference()) {
-        const bool enable_aec = (bits & kWakeWordEnabled) ||
-            (device_aec_enabled_.load() && (bits & kVoiceProcessingEnabled));
+        /* 2026-11-15 唤醒灵敏度②：AEC 只在「真正收音/对话中」开。
+           原因：待机只跑唤醒词时没有播放，参考通道是静音，AEC 没有回声可消，
+           却仍会对麦克风信号做抑制——本机实测远场要"说很慢"才醒，而同门限的
+           另一台（无 AEC 参考通道）正常，差异就在这里。
+           ⚠️ 影响面：仅"待机检测唤醒词"这一段不再过 AEC；对话中
+           （kVoiceProcessingEnabled）仍然按用户设置开 AEC，回声抑制不受影响。 */
+        const bool enable_aec =
+            kUseAfeForVoiceProcessing && device_aec_enabled_.load() && (bits & kVoiceProcessingEnabled);
         if (enable_aec) {
             afe_iface_->enable_aec(afe_data_);
         } else {
