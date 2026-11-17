@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "application.h"
 #include "assets/lang_config.h"
@@ -44,6 +45,16 @@ LvglDisplay::LvglDisplay() {
     }
 }
 
+/* 退休字体池：换字体后旧的 LvglFont 对象一律留在这里、永不销毁。
+   原因见 LvglDisplay::SetTextFont() 里的长注释 —— LVGL 的 style 只存裸
+   lv_font_t*，旧对象一析构，那些指针就变成悬空指针，下一帧画字直接跳垃圾地址。 */
+namespace {
+std::vector<std::shared_ptr<LvglFont>>& RetiredTextFonts() {
+    static std::vector<std::shared_ptr<LvglFont>> fonts;
+    return fonts;
+}
+}  // namespace
+
 bool LvglDisplay::SetTextFont(std::shared_ptr<LvglFont> text_font) {
     if (text_font == nullptr || text_font->font() == nullptr) {
         return false;
@@ -57,8 +68,16 @@ bool LvglDisplay::SetTextFont(std::shared_ptr<LvglFont> text_font) {
         return false;
     }
 
-    // LVGL styles keep raw lv_font_t pointers. Keep the previous font owners alive until the
-    // current theme has rebound every style to the new font.
+    /* ⚠️ 2026-11-16 悬空字体崩溃修复（addr2line 定位，勿删）：
+       LVGL 的 style 里只存裸 lv_font_t*。本板 SetupUI 就把主题字体直接设进了
+       screen 的样式（lcd_display.cc: lv_obj_set_style_text_font(screen, text_font, 0)），
+       所有没显式设字体的 label 都继承它。
+       而 LvglBuiltInFont 的 lv_font_t 是**对象内嵌**的：这里一换字体，旧对象析构，
+       screen 上那份指针立刻悬空。之后任何一帧重画 label 就会走
+       lv_font_get_glyph_dsc() → f->get_glyph_dsc()，跳到被复用内存里的垃圾值。
+       实测 panic: InstructionFetchError，EXCVADDR 落在 .flash.rodata（不是代码区），
+       反查 map 是某个 C++ vtable —— 典型「把数据当函数指针调」。
+       本板从不逐个 object 重设字体，所以旧字体必须退休、不能销毁。 */
     auto previous_light_font = light_theme != nullptr ? light_theme->text_font() : nullptr;
     auto previous_dark_font = dark_theme != nullptr ? dark_theme->text_font() : nullptr;
     if (light_theme != nullptr) {
@@ -70,8 +89,23 @@ bool LvglDisplay::SetTextFont(std::shared_ptr<LvglFont> text_font) {
     if (current_theme_ != nullptr) {
         SetTheme(current_theme_);
     }
-    previous_light_font.reset();
-    previous_dark_font.reset();
+    if (previous_light_font != nullptr) {
+        RetiredTextFonts().push_back(std::move(previous_light_font));
+    }
+    if (previous_dark_font != nullptr) {
+        RetiredTextFonts().push_back(std::move(previous_dark_font));
+    }
+
+    /* 顺手把 screen 上的字体也换成新字体：退休只保证「不崩」，
+       不换的话继承它的 label 还是老字库（中文少字）。 */
+    const lv_font_t* new_font = text_font->font();
+    lv_obj_t* scr = lv_screen_active();
+    if (scr != nullptr && new_font != nullptr) {
+        lv_obj_set_style_text_font(scr, new_font, 0);
+    }
+    /* TEXT_FONT 是可继承属性，已建好的子对象不会自动重算样式，要主动通知一次 */
+    lv_obj_report_style_change(nullptr);
+    ESP_LOGI(TAG, "text font -> %p（旧字体已退休，不销毁）", (const void*)new_font);
     return true;
 }
 

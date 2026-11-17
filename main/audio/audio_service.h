@@ -42,7 +42,10 @@
    实时 opus 流，网络一抖（>120ms）解码队列跟不上，I2S DMA（60ms）一饿
    就是爆音。提到 6 帧 = 360ms（加上 DMA 共约 420ms 抗抖动），代价是
    TTS 起播多等约 0.3 秒 —— 远比中途卡顿可接受。 */
-#define MAX_PLAYBACK_TASKS_IN_QUEUE 6
+/* 2026-11-17：6 帧 = 360ms 是硬上限，抖动缓冲目标提到 400/600 时**攒不到**
+   —— 解码队列被这行卡住，蓄水等到超时也只够 360ms。跟着目标一起放宽到 10 帧
+   （600ms；每帧 2.8KB，多占约 11KB PSRAM）。 */
+#define MAX_PLAYBACK_TASKS_IN_QUEUE 10
 #define MAX_DECODE_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
 #define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
 #define AUDIO_TESTING_MAX_DURATION_MS 10000
@@ -137,6 +140,11 @@ public:
 
     uint32_t gate_suppressed_ = 0;   /* 被门限滤掉的帧数（回声） */
     uint32_t gate_passed_ = 0;       /* 门限放行的帧数（真人声/大声） */
+    /* 2026-11-16 打断防误触：连续超过能量门限的帧数。
+       要求连续 N 帧（N×60ms）都高于门限才真正放行 —— 一次回声尖峰、
+       一声关门、一声咳嗽都只有 1 帧，凑不满 N 帧，不会打断 AI。
+       真人开口通常持续 300ms 以上，3 帧（180ms）稳过。 */
+    uint8_t gate_hot_frames_ = 0;
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
 
@@ -195,8 +203,15 @@ private:
        服务端按分片推流（一批 0.5~0.8s，批间隔 0.6~1.0s），固定 0.42s 缓冲
        兜不住。每轮开口前先攒 jitter_target_ms_：断流一次 +200ms（上限 800），
        整轮没断 -100ms（下限 200），平时靠 200ms 保持低延迟。 */
-    static constexpr int kJitterMinMs = 200;
-    static constexpr int kJitterMaxMs = 800;
+    /* 2026-11-17 第二轮实测结论（重要）：
+       上游音频是**按 1x 实数率**来的（16.7 包/秒），服务端只是每隔 1.6 秒
+       停 150~500ms。缓冲只有在「服务端提前发」时才有意义；它不提前发，
+       把下限从 200 抬到 400 只会增加每轮开口延迟，一个洞也补不上
+       —— 用户实测「还是卡、而且段落延迟更长」。
+       所以延迟优先：下限压到 120ms（2 帧），上限 400ms，
+       只在真的断过（>90ms 洞）时才小幅加码。 */
+    static constexpr int kJitterMinMs = 120;
+    static constexpr int kJitterMaxMs = 400;
     int jitter_target_ms_ = kJitterMinMs;
     bool jitter_priming_ = false;      // true = 本轮还没开口，正在蓄水
     bool jitter_turn_had_gap_ = false; // 本轮是否发生过断流（用于自适应调整）

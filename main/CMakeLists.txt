@@ -35,6 +35,7 @@ set(SOURCES             "audio/audio_codec.cc"
             "protocols/websocket_protocol.cc"
             "mcp_server.cc"
             "system_info.cc"
+            "system_guard.cc"
             "application.cc"
             "ota.cc"
             "settings.cc"
@@ -742,6 +743,18 @@ elseif(CONFIG_BOARD_TYPE_ZHENGCHEN_1_54TFT_WIFI)
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
     set(BUILTIN_ICON_FONT font_material_symbols_20_4)
     set(DEFAULT_EMOJI_COLLECTION noto-color-emoji_64)
+elseif(CONFIG_BOARD_TYPE_ZHENGCHEN_1_54TFT_DAFEIYU)
+    # 大飞鱼精简版：同款 240x240 硬件，只做「壁纸 + 时钟」。
+    # 时钟用 LVGL 自带的 montserrat_48（在 config.json 的 sdkconfig_append 里开），
+    # 其余文字仍用 20_4，和 1.54tft-wifi 保持一致。
+    set(BOARD_DIR "zhengchen/1.54tft-dafeiyu")
+    set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
+    set(BUILTIN_ICON_FONT font_material_symbols_20_4)
+    # 2026-11-16 修正：本板角色是 assets/dafeiyu/*.gif（17 个，约 305KB），
+    # 名字与 dafeiyu_display.cc 的 AssetName() 一一对应。
+    # 之前误设成 noto-color-emoji_64，打进去的是 angry/neutral 那套 png，
+    # 于是 dafeiyu_idle / dafeiyu_boot 全部 miss，表情层刷 "Emoji not found"。
+    set(DEFAULT_EMOJI_COLLECTION dafeiyu)
 elseif(CONFIG_BOARD_TYPE_MINSI_K08_DUAL)
     set(BOARD_DIR "minsi-k08-dual")
     set(BUILTIN_TEXT_FONT font_noto_sans_basic_20_4)
@@ -887,7 +900,7 @@ file(GLOB BOARD_SOURCES
 # 上面的 GLOB 扫不到，必须显式加进来。
 # 只在正辰 cam 板启用：emote_imgs.c 源文件 8.4MB（编译后约 1.5MB 数据），
 # 给别的板子白编译一遍太慢。
-if(BOARD_DIR STREQUAL "zhengchen/cam")
+if(BOARD_DIR STREQUAL "zhengchen/cam" OR BOARD_DIR STREQUAL "zhengchen/1.54tft-dafeiyu")
     list(APPEND SOURCES
         "${PROJECT_DIR}/_emotes/emote_imgs.c"
         "${PROJECT_DIR}/_emotes/pet_emotes.c"
@@ -905,6 +918,7 @@ if(BOARD_DIR STREQUAL "zhengchen/cam")
 # 组件 PRIV_INCLUDE，main 拿不到，这里把路径挂进本组件的搜索列表）。
 list(APPEND INCLUDE_DIRS "${CMAKE_CURRENT_LIST_DIR}/../managed_components/espressif2022__esp_emote_gfx/src/lib/qrcode")
 endif()
+
 list(APPEND SOURCES ${BOARD_SOURCES})
 
 # Select one audio engine for each chip family
@@ -1115,6 +1129,8 @@ idf_component_register(SRCS ${SOURCES}
                         app_update
                         spi_flash
                         mbedtls
+                        esp_http_client
+                        esp-tls
                         console
                         efuse
                         bt

@@ -1,0 +1,17 @@
+{
+    "manufacturer": "zhengchen",
+    "type": "zhengchen-1.54tft-dafeiyu",
+    "target": "esp32s3",
+    "builds": [
+        {
+            "name": "zhengchen-1.54tft-dafeiyu",
+            "sdkconfig_append": [
+                "CONFIG_LV_USE_FONT_COMPRESSED=y",
+                "CONFIG_LV_USE_FONT_PLACEHOLDER=y",
+                "CONFIG_LV_FONT_MONTSERRAT_48=y",
+                "CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=48",
+                "CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32"
+            ]
+        }
+    ]
+}

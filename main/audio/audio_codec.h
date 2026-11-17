@@ -12,7 +12,14 @@
 
 #include "board.h"
 
-#define AUDIO_CODEC_DMA_DESC_NUM 6
+/* 2026-11-17 卡顿修复（单点改动）：6 → 12。
+   24kHz 下 6×240 = 1440 帧 = 60ms，正好等于服务端一帧的时长，硬件余量为 0。
+   audio_output 任务只要被抢占/等锁超过 60ms，DMA 就空，喇叭立刻断一下
+   （对应 AUDIO out 日志里的 local 计数）。加到 12×240 = 120ms，
+   可吸收 60~120ms 的调度抖动；代价是稳态播放延迟 +60ms、内部 RAM 约 +17KB
+   （TX 立体声与 RX TDM 4ch 的 DMA 深度各翻倍）。
+   回滚：把 12 改回 6 即可。 */
+#define AUDIO_CODEC_DMA_DESC_NUM 12
 #define AUDIO_CODEC_DMA_FRAME_NUM 240
 
 // ESP-IDF 6 removed i2s_port_t and changed i2s_chan_config_t::id to an integer.

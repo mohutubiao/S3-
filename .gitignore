@@ -32,8 +32,17 @@ mmap_generate_*.h
 # 根目录素材源与临时工作目录（注意：main/assets 是运行时资源，不能排除）
 /_*/
 /assets/
-# 板级工作副本
+# 板级工作副本 / 临时预览与备份
 main/boards/zhengchen/cam/_wip/
+main/boards/zhengchen/cam/_*
+*.bak
+# ── 2026-11-17 构建产物与发布包 ─────────────────────────────────
+# 双固件方案的另一个 build 目录（默认 build/ 已在上面忽略）
+/build_dafeiyu/
+# 固件发布包（zip + 各分段 bin），体积大，不进版本库
+/release/
+# 根目录构建日志
+/build_log*.txt
 # 含本机路径 / 个人信息的笔记
 CODEBUDDY.md
 S3成品板-工程说明.md

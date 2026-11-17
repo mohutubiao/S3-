@@ -7,6 +7,7 @@
 #include "mcp_server.h"
 #include "mqtt_protocol.h"
 #include "settings.h"
+#include "system_guard.h"
 #include "system_info.h"
 #include "text_glyph_payload.h"
 #include "websocket_protocol.h"
@@ -210,6 +211,9 @@ void Application::Initialize() {
 void Application::Run() {
     // Set the priority of the main task to 10
     vTaskPrioritySet(nullptr, 10);
+    /* 2026-11-17 心跳护栏：主任务卡锁时整机看着像死机（屏幕不动、BOOT 无反应），
+       而 IDF 的 task WDT 只盯 idle 任务，永远不报警。这里主动上报心跳。 */
+    SystemGuardInit();
 
     const EventBits_t ALL_EVENTS =
         MAIN_EVENT_SCHEDULE | MAIN_EVENT_SEND_AUDIO | MAIN_EVENT_WAKE_WORD_DETECTED |
@@ -219,7 +223,12 @@ void Application::Run() {
         MAIN_EVENT_STATE_CHANGED | MAIN_EVENT_PLAYBACK_DRAINED;
 
     while (true) {
-        auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE, portMAX_DELAY);
+        /* 2026-11-17：原来是 portMAX_DELAY —— 空闲时永远等在这里，心跳护栏
+           没法区分「空闲」和「卡死」。改成 500ms 超时，空闲也照样喂心跳；
+           真正卡在锁上时这里就再也走不到，护栏能准确判定。 */
+        auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE,
+                                        pdMS_TO_TICKS(500));
+        SystemGuardNotifyMain();
 
         if (bits & MAIN_EVENT_ERROR) {
             SetDeviceState(kDeviceStateIdle);
@@ -1115,7 +1124,12 @@ void Application::HandleWakeWordDetectedEvent() {
 void Application::BeginWakeWordInvoke(const std::string& wake_word) {
     // Must run in the main task with the device in idle state
     CancelIdleChannelClose();   /* 2026-11-14：语音唤醒也要开始用通道了 */
+    /* 2026-11-16：只有把唤醒词音频上报给服务器时才需要编码它。
+       CONFIG_SEND_WAKE_WORD_DATA 关掉后（用户要求「唤醒只响音效、进聆听，
+       不要让 AI 主动开口」），这里再编码就是白烧 CPU，且队列没人消费。 */
+#if CONFIG_SEND_WAKE_WORD_DATA
     audio_service_.EncodeWakeWord();
+#endif
 
     // Always pass through the connecting state, even if the audio channel is
     // already opened. ContinueWakeWordInvoke() rejects any other state, so

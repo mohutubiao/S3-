@@ -604,6 +604,9 @@ choice BOARD_TYPE
     config BOARD_TYPE_ZHENGCHEN_1_54TFT_WIFI
         bool "Zhengchen 1.54-inch TFT Wi-Fi (征辰科技)"
         depends on IDF_TARGET_ESP32S3
+    config BOARD_TYPE_ZHENGCHEN_1_54TFT_DAFEIYU
+        bool "Zhengchen 1.54-inch TFT Wi-Fi Lite (征辰科技·大飞鱼精简版)"
+        depends on IDF_TARGET_ESP32S3
     config BOARD_TYPE_ZHENGCHEN_CAM_ML307
         bool "Zhengchen AI Camera ML307 (征辰科技)"
         depends on IDF_TARGET_ESP32S3

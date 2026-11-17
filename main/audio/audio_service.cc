@@ -387,20 +387,25 @@ void AudioService::AudioOutputTask() {
         if (jitter_priming_) {
             const int frame_ms = decoder_duration_ms_ > 0 ? decoder_duration_ms_ : 60;
             const size_t need = (size_t)std::max(1, jitter_target_ms_ / frame_ms);
-            const auto deadline =
-                std::chrono::steady_clock::now() + std::chrono::milliseconds(jitter_target_ms_ + 500);
+            /* 2026-11-17 实测修正：把等待上限拉到 1200ms 试过一版 ——
+               用户反馈「还是卡，而且段落延迟更长」，说明上游是按 1x 实数率
+               出的，等再久也等不到多余的水，只是白白拖慢开口。
+               回退成短等待（目标 + 300ms），延迟优先；蓄水不足如实打日志。 */
+            const int wait_ms = jitter_target_ms_ + 300;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
+            size_t buffered = 0;
             while (!service_stopped_.load() && std::chrono::steady_clock::now() < deadline) {
-                const size_t buffered = audio_playback_queue_.size() + audio_decode_queue_.size() +
-                                        (decode_in_flight_ ? 1 : 0);
+                buffered = audio_playback_queue_.size() + audio_decode_queue_.size() +
+                           (decode_in_flight_ ? 1 : 0);
                 if (buffered >= need) {
                     break;
                 }
                 audio_queue_cv_.wait_for(lock, std::chrono::milliseconds(20));
             }
             jitter_priming_ = false;
-            ESP_LOGI(TAG, "抖动缓冲就绪：目标 %dms，实攒 %u 帧（≈%ums）", jitter_target_ms_,
-                     (unsigned)(audio_playback_queue_.size() + audio_decode_queue_.size()),
-                     (unsigned)((audio_playback_queue_.size() + audio_decode_queue_.size()) * frame_ms));
+            ESP_LOGI(TAG, "抖动缓冲就绪：目标 %dms，实攒 %u 帧（≈%ums）%s", jitter_target_ms_,
+                     (unsigned)buffered, (unsigned)(buffered * frame_ms),
+                     buffered >= need ? "" : " ← 蓄水不足（服务端出流慢），开播后可能断一下");
         }
 
         auto task = std::move(audio_playback_queue_.front());
@@ -411,12 +416,17 @@ void AudioService::AudioOutputTask() {
         // 播放节奏≈到达节奏时队列本来就常空，数值高低并不等于听感卡顿。
         // 真正可听的爆音 = 相邻两次喂 I2S 的间隔明显超过一帧时长（60ms），
         // DMA 在那段时间里没数据，喇叭就是静音/咔哒。所以统计三件事：
-        //   gap  = 相邻 OutputData 调用间隔 >200ms 的次数（>3 帧 = 必然可听）；
+        //   gap  = 相邻 OutputData 调用间隔 >90ms 的次数。
+        //          2026-11-17：门槛从 200ms 降到 90ms —— 喇叭断 40ms 就听得出来，
+        //          旧的 200ms 门槛把用户实际听到的 100~190ms 小洞全漏掉了，
+        //          于是「日志零断档、耳朵一直抖」，自适应缓冲也永远不知道要加码。
         //   gmax = 本窗口最大间隔 ms（2 秒 = 整句没声，200ms = 抖一下）；
         //   cost = OutputData 自身耗时（>60ms 说明任务被抢占/写 I2S 阻塞）。
         // 对照同时刻的 "ws audio stats"：gmax 大且 ws 同期也没包 = 上游出流洞；
         // gmax 大而 ws 同期有包 = 设备端解码/调度问题。
         static uint32_t s_total = 0, s_gap = 0, s_gmax = 0, s_costmax = 0, s_local = 0, s_upstream = 0;
+        /* 2026-11-17 静音帧取证：quiet = 本窗口内"峰值极低"的帧数。 */
+        static uint32_t s_quiet = 0;
         static auto s_last_out = std::chrono::steady_clock::now();
         static bool s_has_last = false;
         /* 与 g_ws_last_audio_arrival_ms 同一时钟域（esp_timer 毫秒），
@@ -441,7 +451,7 @@ void AudioService::AudioOutputTask() {
             /* ⚠️ >2s 的间隔是对话静默（一轮说完等下一轮），不是播放断档。
                以前把它算进 gmax，才会出现 "gmax=122532ms" 这种废数据，
                连 local/upstream 归因也一起被污染。直接丢弃这一样本。 */
-            if (gap_ms > 200 && gap_ms <= 2000) {
+            if (gap_ms > 90 && gap_ms <= 2000) {
                 s_gap++;
                 /* 自适应：真断了一次就把缓冲目标加上去，下一轮开口更晚但不断 */
                 jitter_turn_had_gap_ = true;
@@ -481,13 +491,38 @@ void AudioService::AudioOutputTask() {
             } else if (gap_ms > 2000) {
                 /* 跨轮静默：本窗口不下结论，直接跳过，别污染统计 */
             }
-            if (gap_ms > 200 && gap_ms <= 2000 && gap_ms > s_gmax) {
+            if (gap_ms > 90 && gap_ms <= 2000 && gap_ms > s_gmax) {
                 s_gmax = gap_ms;
             }
         }
         s_last_out = out_begin;
         s_last_out_ms = now_ms;
         s_has_last = true;
+
+        /* 2026-11-17 静音帧取证（纯统计，不改播放）：
+           现有 gap 只看两次 OutputData 的间隔。服务端用静音帧填出流洞时，
+           输出节奏完全正常（gap=0），喇叭里却是空的 —— 这就是"日志零断档、
+           耳朵一直顿"的盲区。这里按帧峰值判定"这一帧其实没声音"（<500 ≈ -36dBFS），
+           与 gap 对照即可定责：
+             · gap=0 且 quiet 涨 → 上游静音填洞，设备端只能做防咔哒，不能造声音；
+             · gap>0 且 quiet 不涨 → 设备端喂数断，继续动 DMA/调度；
+             · 两者都为 0 → 数据本身连续，顿来自句子拼接等非音频因素。
+           峰值用比较实现（1440 次），每帧 60ms 一次，开销可忽略。 */
+        {
+            int32_t peak = 0;
+            for (size_t i = 0; i < task->pcm.size(); ++i) {
+                int32_t v = task->pcm[i];
+                if (v < 0) {
+                    v = -v;
+                }
+                if (v > peak) {
+                    peak = v;
+                }
+            }
+            if (peak < 500) {
+                s_quiet++;
+            }
+        }
 
         codec_->OutputData(task->pcm);
 
@@ -506,14 +541,17 @@ void AudioService::AudioOutputTask() {
                 wifi_ps_type_t ps = WIFI_PS_MIN_MODEM;
                 esp_wifi_get_ps(&ps);
                 ESP_LOGW(TAG,
-                         "AUDIO out: frames=%u gap>200ms=%u(local=%u upstream=%u) gmax=%ums costmax=%ums ps=%d",
-                         s_total, s_gap, s_local, s_upstream, (unsigned)s_gmax, (unsigned)s_costmax, (int)ps);
+                         "AUDIO out: frames=%u gap>90ms=%u(local=%u upstream=%u) gmax=%ums costmax=%ums "
+                         "quiet=%u ps=%d",
+                         s_total, s_gap, s_local, s_upstream, (unsigned)s_gmax, (unsigned)s_costmax,
+                         (unsigned)s_quiet, (int)ps);
                 s_total = 0;
                 s_gap = 0;
                 s_gmax = 0;
                 s_costmax = 0;
                 s_local = 0;
                 s_upstream = 0;
+                s_quiet = 0;
             }
         }
 
@@ -647,8 +685,19 @@ void AudioService::OpusCodecTask() {
                    用户直接开口的声音被整段填成静音，服务器收不到 → 只能等超时
                    回待机（表现为"打断像没反应"）。降到 280 让正常说话容易过，
                    离回声残余（<300）仍有区分度；若出现 AI 被自己声音打断，
-                   再往 320~350 回调。 */
-                static constexpr double kUplinkGateRms = 280.0;
+                   再往 320~350 回调。
+                   ⚠️ 2026-11-16 用户反馈「语音打断有点太灵敏」→ 280 → 340。
+                   这就是上面预留的回调区间：轻声/环境噪声不再能戳穿门限，
+                   正常开口的音量（RMS 通常 >1000）仍远高于它，打断可用。
+                   若之后又变成"喊了没反应"，降到 310 试；
+                   若依旧灵敏，往上最多到 380（再高回声残余就可能漏进去）。
+                   ⚠️ 2026-11-16 第二次反馈「还是太灵敏」：单纯抬门限治不了 ——
+                   回声残余偶尔整帧冲过 340，一帧就够服务器 VAD 起判。改成
+                   **连续帧确认**：必须连续 kUplinkGateConfirmFrames 帧（60ms/帧）
+                   都高于门限才放行，中途掉一帧就清零重新数。真人开口 300ms+
+                   稳过 3 帧；一声咳嗽/关门/回声尖峰只有 1 帧，打断不了。 */
+                   static constexpr double kUplinkGateRms = 340.0;
+                   static constexpr uint8_t kUplinkGateConfirmFrames = 3;   /* 180ms */
                 /* ── 2026-11-07 上行静音门限（AI 回话碎段根治）──
                    现象：AI 说话被服务器切成一段一段（两个通道都复现，
                    日志见 WS 收到服务器 0x8 关闭帧）。机理：喇叭声的 AEC
@@ -663,11 +712,23 @@ void AudioService::OpusCodecTask() {
                         acc += (int64_t)s * s;
                     }
                     const double rms = sqrt((double)acc / (double)task->pcm.size());
+                    /* 连续帧确认：低于门限立刻清零；高于门限要连中 N 帧才开口。
+                       前 N-1 帧仍然发静音 —— 宁可慢 180ms 让真人开口，也不让
+                       单帧回声尖峰把 AI 的话掐掉。 */
+                    bool allow = false;
                     if (rms < kUplinkGateRms) {
+                        gate_hot_frames_ = 0;
+                    } else if (gate_hot_frames_ < kUplinkGateConfirmFrames) {
+                        gate_hot_frames_++;
+                        allow = (gate_hot_frames_ >= kUplinkGateConfirmFrames);
+                    } else {
+                        allow = true;   /* 已在放行段，保持 */
+                    }
+                    if (allow) {
+                        gate_passed_++;
+                    } else {
                         std::fill(task->pcm.begin(), task->pcm.end(), 0);
                         gate_suppressed_++;
-                    } else {
-                        gate_passed_++;
                     }
                 }
                 std::vector<uint8_t> buf(encoder_outbuf_size_);
@@ -717,6 +778,7 @@ void AudioService::OpusCodecTask() {
 }
 
 void AudioService::SetUplinkSuppress(bool suppress) {
+    gate_hot_frames_ = 0;   /* 每次开关闸都从零开始数连续帧，别带上一次的残留 */
     if (!suppress && (gate_suppressed_ > 0 || gate_passed_ > 0)) {
         /* 每次关闭（AI 说完/被打断）打一条：如果 suppressed 为 0 = 门限
            没拦到任何回声（说明残余回声 RMS 全部高于门限 → 门限值偏低，

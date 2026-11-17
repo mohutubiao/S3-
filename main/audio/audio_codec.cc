@@ -1,11 +1,20 @@
 #include "audio_codec.h"
 #include "board.h"
 #include "settings.h"
+/* 2026-11-16 这两个钩子分两档，别再合成一个宏：
+   · 唤醒球（orb_*）只有 cam 完整版编译，别的板子链不到 orb_feed_pcm_global；
+   · 音乐频谱（spec_fft.c）精简版也要 —— 说话/放歌时用真 FFT 画柱子。
+   合成一个宏会让精简版报「orb_audio.h: No such file or directory」。 */
+#if CONFIG_BOARD_TYPE_ZHENGCHEN_CAM
 #include "orb_audio.h"      // orb_feed_pcm_global：把播放/录音 PCM 转成唤醒球的电平
+#endif
+#if CONFIG_BOARD_TYPE_ZHENGCHEN_CAM || CONFIG_BOARD_TYPE_ZHENGCHEN_1_54TFT_DAFEIYU
 #include "spec_fft.h"       // 2026-11-06 音乐频谱：输出 PCM 专用通道（只 memcpy，FFT 在显示任务做）
+#endif
 
 #include <esp_log.h>
 #include <esp_timer.h>
+#include <sdkconfig.h>   // CONFIG_BOARD_TYPE_ZHENGCHEN_CAM
 #include <cstring>
 #include <driver/i2s_common.h>
 
@@ -22,12 +31,16 @@ void AudioCodec::OutputData(std::vector<int16_t>& data) {
        一处挂钩对所有音频方案（ES8311/ES8388/NoCodec…）都生效。
        orb_feed_pcm_global 内部只做 Goertzel + 量化，不碰 LVGL、不加锁。 */
     if (!data.empty()) {
+#if CONFIG_BOARD_TYPE_ZHENGCHEN_CAM
         orb_feed_pcm_global(data.data(), (int)data.size());
+#endif
+#if CONFIG_BOARD_TYPE_ZHENGCHEN_CAM || CONFIG_BOARD_TYPE_ZHENGCHEN_1_54TFT_DAFEIYU
         /* 2026-11-06 音乐频谱专用通道：只 memcpy 进环形缓冲，FFT 在 LVGL
            tick 里做（音频路径零计算 —— 上次音乐卡顿的教训）。
            只加在 OutputData，InputData 不动：麦克风链路喂进来会导致
            待机听环境声时频谱乱跳。 */
         spec_fft_feed_pcm(data.data(), (int)data.size());
+#endif
     }
     /* ── 2026-11-15 防「咔哒/字被切碎」：缓冲区余量本来是 0 ──────────────
        I2S DMA 是 6×240 帧，24kHz 下正好 60ms；而服务器一帧 PCM 也正好
@@ -56,8 +69,10 @@ void AudioCodec::OutputData(std::vector<int16_t>& data) {
 bool AudioCodec::InputData(std::vector<int16_t>& data) {
     int samples = Read(data.data(), data.size());
     if (samples > 0) {
+#if CONFIG_BOARD_TYPE_ZHENGCHEN_CAM
         /* 聆听时让球跟着麦克风的音量/频谱起伏 */
         orb_feed_pcm_global(data.data(), samples);
+#endif
         return true;
     }
     return false;
