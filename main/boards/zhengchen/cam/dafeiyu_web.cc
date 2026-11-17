@@ -1956,7 +1956,20 @@ bool StartWebServer() {
            之前只干等重试，等于永远起不来。这里主动把配置 AP 停掉再重试。 */
         auto& wm = WifiManager::GetInstance();
         if (wm.IsConfigMode()) {
-            ESP_LOGW(TAG, "80 被配网 AP 占用，停掉配置 AP 后重试");
+            /* ⚠️ 2026-11-17 修复「开机反复进配网、反复播报 AP」：
+               以前这里只要 IsConfigMode() 就 StopConfigAp()，但配网期间
+               配网页**本来就该占着 80**（手机要靠它配置）。控制页每 3 秒
+               重试一次，每次都把配网 AP 拆掉 → 板级收到 ConfigModeExit →
+               没 SSID → 1.5 秒后又重进配网 → 再播报一次，实测 3 秒一轮
+               无限循环（串口 40 秒内 Access Point started 13 次）。
+               正确判据是「是否已经真的连上路由器」：
+                 · 没连上 = 正在配网，控制页无条件让路，绝不拆配网；
+                 · 已连上 = 配网残留没退干净（2026-11-13 那种情况），才停它。 */
+            if (!wm.IsConnected()) {
+                ESP_LOGD(TAG, "配网进行中，控制页让路（等配网结束后再起）");
+                return false;
+            }
+            ESP_LOGW(TAG, "已联网但配网 AP 仍占 80，停掉配置 AP 后重试");
             wm.StopConfigAp();
             vTaskDelay(pdMS_TO_TICKS(600));
             start_err = httpd_start(&server, &config);

@@ -249,6 +249,13 @@ void WifiBoard::StartNetwork() {
 }
 
 void WifiBoard::TryWifiConnect() {
+    /* 配网模式保持期间不反复去连：以前这里会因 WifiConfigModeExit 回调再进来，
+       没有 SSID 时又走一遍 StartWifiConfigMode → 再播报一次 AP 提示音。 */
+    if (config_mode_started_) {
+        ESP_LOGW(TAG, "配网模式保持中，跳过重复连接尝试");
+        return;
+    }
+
     auto& ssid_manager = SsidManager::GetInstance();
     bool have_ssid = !ssid_manager.GetSsidList().empty();
 
@@ -293,6 +300,9 @@ void WifiBoard::OnNetworkEvent(NetworkEvent event, const std::string& data) {
         case NetworkEvent::WifiConfigModeExit:
             ESP_LOGI(TAG, "WiFi config mode exited");
             in_config_mode_ = false;
+            /* 只有真正退出配网才允许下一次进入（新凭据去连 / 连失败再回来配网）。
+               先清零再 TryWifiConnect，否则会被上面的保持守卫挡掉。 */
+            config_mode_started_ = false;
             // Try to connect with the new credentials
             TryWifiConnect();
             break;
@@ -312,6 +322,14 @@ void WifiBoard::SetNetworkEventCallback(NetworkEventCallback callback) {
 
 void WifiBoard::OnWifiConnectTimeout(void* arg) {
     auto* board = static_cast<WifiBoard*>(arg);
+
+    /* 已经在配网里就不再做任何动作：既不 StopStation（会再发一次 Disconnected
+       让上层状态机抖动），也不重进配网（会重复播报提示音）。 */
+    if (board->config_mode_started_ || board->in_config_mode_) {
+        ESP_LOGW(TAG, "配网模式已在保持中，忽略连接超时");
+        return;
+    }
+
     ESP_LOGW(TAG, "WiFi connection timeout, entering config mode");
 
     WifiManager::GetInstance().StopStation();
@@ -319,6 +337,14 @@ void WifiBoard::OnWifiConnectTimeout(void* arg) {
 }
 
 void WifiBoard::StartWifiConfigMode() {
+    /* 幂等：配网只拉起一次。AP 一旦开起来就常驻，提示音只播一次；
+       重复调用（超时重试 / 按键 / 事件回调 / 状态机抖动）全部忽略。 */
+    if (config_mode_started_) {
+        ESP_LOGW(TAG, "配网模式已在进行中，忽略重复进入（AP 保持）");
+        return;
+    }
+    config_mode_started_ = true;
+
     in_config_mode_ = true;
     // Transition to wifi configuring state
     Application::GetInstance().SetDeviceState(kDeviceStateWifiConfiguring);
@@ -345,6 +371,14 @@ void WifiBoard::StartWifiConfigMode() {
 
 void WifiBoard::EnterWifiConfigMode() {
     ESP_LOGI(TAG, "EnterWifiConfigMode called");
+
+    /* 已经在配网里（AP 常驻、提示音已播过）：不去重复 ResetProtocol / 重开 AP，
+       否则按键连点或上层重复调用会表现为「反复进入配网」。 */
+    if (config_mode_started_) {
+        ESP_LOGW(TAG, "已在配网模式并保持中，忽略重复进入");
+        return;
+    }
+
     GetDisplay()->ShowNotification(Lang::Strings::ENTERING_WIFI_CONFIG_MODE);
 
     auto& app = Application::GetInstance();

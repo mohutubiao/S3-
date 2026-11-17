@@ -10,6 +10,11 @@ class WifiBoard : public Board {
 protected:
     esp_timer_handle_t connect_timer_ = nullptr;
     bool in_config_mode_ = false;
+    /* 2026-11-17 配网只拉起一次：AP 常驻、提示音只播一次。
+       之后无论谁来调 StartWifiConfigMode()/TryWifiConnect()（超时、按键、
+       事件回调、上层状态机抖动）都直接忽略，只有真正退出配网
+       （WifiConfigModeExit）才清零，让新凭据能去连。 */
+    bool config_mode_started_ = false;
     NetworkEventCallback network_event_callback_ = nullptr;
 
     virtual std::string GetBoardJson() override;
